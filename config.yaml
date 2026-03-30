@@ -1,0 +1,21 @@
+warehouse: file:///warehouse
+catalog: iceberg
+namespace: default
+table_name: cloudwatch_logs
+
+cloudwatch:
+  endpoint_url: http://localhost:4588
+  region: ap-southeast-1
+
+spark:
+  app_name: CloudWatchLogPersist
+  master: local[*]
+
+compaction:
+  enabled: true
+  interval_seconds: 10
+  max_log_lines: 10000
+
+partition:
+  strategy: log_group
+  log_group_buckets: 10

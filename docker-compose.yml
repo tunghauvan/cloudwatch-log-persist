@@ -1,0 +1,16 @@
+services:
+  cloudwatch-local-service:
+    build: .
+    container_name: cloudwatch-local-service
+    working_dir: /app
+    volumes:
+      - ./src/cloudwatch_local_service:/app/cloudwatch_local_service
+      - ./src:/app/src
+      - ./warehouse:/warehouse
+      - ./config.yaml:/app/config.yaml
+    ports:
+      - 4588:4588
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+    command: ["python", "-m", "flask", "--app", "cloudwatch_local_service.server", "run", "--host", "0.0.0.0", "--port", "4588"]
