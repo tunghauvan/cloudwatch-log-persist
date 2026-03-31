@@ -187,8 +187,9 @@ class WarehouseManager:
         except Exception:
             pass
 
+        table_id = f"{self.namespace}.{self.table_name}"
+
         try:
-            table_id = f"{self.namespace}.{self.table_name}"
             self._table = self.catalog.create_table(
                 table_id,
                 schema=self._get_schema(),
@@ -196,8 +197,73 @@ class WarehouseManager:
             )
             print(f"[Warehouse] Created table with partition spec")
         except Exception as e:
-            self._table = self.catalog.load_table(f"{self.namespace}.{self.table_name}")
-            print(f"[Warehouse] Loaded existing table: {e}")
+            print(f"[Warehouse] Create table exception: {type(e).__name__}: {e}")
+            print(f"[Warehouse] Attempting to check and repair catalog...")
+
+            if self._check_and_repair_catalog():
+                try:
+                    self._table = self.catalog.load_table(table_id)
+                    print(f"[Warehouse] Repaired and loaded table")
+                except Exception as load_err:
+                    print(f"[Warehouse] Load after repair failed: {load_err}")
+                    raise
+            else:
+                print(f"[Warehouse] Repair failed, re-raising original exception")
+                raise e
+
+    def _check_and_repair_catalog(self) -> bool:
+        import psycopg2
+
+        try:
+            table_path = self.get_table_path()
+            metadata_dir = table_path / "metadata"
+
+            if not metadata_dir.exists():
+                print(f"[Warehouse] No metadata directory found at {metadata_dir}")
+                return False
+
+            metadata_files = sorted(metadata_dir.glob("*.metadata.json"))
+            if not metadata_files:
+                print(f"[Warehouse] No metadata files found in {metadata_dir}")
+                return False
+
+            latest_metadata = metadata_files[-1]
+            new_location = str(latest_metadata.absolute())
+
+            db_config = self.config.get("database", {})
+            conn = psycopg2.connect(
+                host=db_config.get("host", "localhost"),
+                port=db_config.get("port", 5432),
+                dbname=db_config.get("name", "iceberg_db"),
+                user=db_config.get("user", "admin"),
+                password=db_config.get("password", "admin123"),
+            )
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT metadata_location FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
+                (self.namespace, self.table_name),
+            )
+            row = cursor.fetchone()
+
+            if row:
+                current_location = row[0]
+                if current_location != new_location:
+                    print(
+                        f"[Warehouse] Catalog mismatch: catalog={current_location}, latest={latest_metadata.name}"
+                    )
+                    cursor.execute(
+                        "UPDATE iceberg_tables SET metadata_location = %s WHERE table_namespace = %s AND table_name = %s",
+                        (new_location, self.namespace, self.table_name),
+                    )
+                    conn.commit()
+                    print(f"[Warehouse] Updated catalog to {latest_metadata.name}")
+
+            cursor.close()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[Warehouse] Catalog check/repair failed: {e}")
+            return False
 
     def get_table_path(self, table_name: Optional[str] = None) -> Path:
         name = table_name or self.table_name
