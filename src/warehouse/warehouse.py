@@ -53,14 +53,30 @@ class WarehouseManager:
 
         if self._catalog is None:
             self._warehouse_dir.mkdir(parents=True, exist_ok=True)
-            db_path = self._warehouse_dir / "catalog.db"
-            self._catalog = load_catalog(
-                "sql",
-                **{
-                    "uri": f"sqlite:///{db_path.absolute()}",
-                    "warehouse": str(self._warehouse_dir.absolute()),
-                },
-            )
+
+            if self.catalog_name == "postgresql":
+                db_config = self.config.get("database", {})
+                host = db_config.get("host", "localhost")
+                port = db_config.get("port", 5432)
+                name = db_config.get("name", "iceberg_db")
+                user = db_config.get("user", "admin")
+                password = db_config.get("password", "admin123")
+                self._catalog = load_catalog(
+                    "sql",
+                    **{
+                        "uri": f"postgresql://{user}:{password}@{host}:{port}/{name}",
+                        "warehouse": str(self._warehouse_dir.absolute()),
+                    },
+                )
+            else:
+                db_path = self._warehouse_dir / "catalog.db"
+                self._catalog = load_catalog(
+                    "sql",
+                    **{
+                        "uri": f"sqlite:///{db_path.absolute()}",
+                        "warehouse": str(self._warehouse_dir.absolute()),
+                    },
+                )
         return self._catalog
 
     def _get_schema(self) -> Schema:

@@ -19,6 +19,19 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 file_storage = FileStorage(LOGS_DIR)
 
+config_path = Path(os.getenv("CONFIG_PATH", "/app/config.yaml"))
+warehouse = None
+try:
+    from warehouse.warehouse import WarehouseManager
+
+    warehouse = WarehouseManager(str(config_path))
+    warehouse.ensure_warehouse()
+    print(
+        f"[Warehouse] Initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}"
+    )
+except Exception as e:
+    print(f"[Warehouse] Failed to initialize: {e}")
+
 app.register_blueprint(logs_bp)
 app.register_blueprint(groups_bp)
 app.register_blueprint(streams_bp)
@@ -138,6 +151,23 @@ def put_log_events():
     next_token = str(new_sequence)
 
     file_storage.save_logs(log_group_name, log_stream_name, log_events, ingestion_time)
+
+    if warehouse:
+        try:
+            warehouse_logs = [
+                {
+                    "logGroupName": log_group_name,
+                    "logStreamName": log_stream_name,
+                    "timestamp": event.get("timestamp") * 1000,
+                    "message": event.get("message"),
+                    "ingestionTime": ingestion_time * 1000,
+                    "sequenceToken": new_sequence,
+                }
+                for event in log_events
+            ]
+            warehouse.insert_logs(warehouse_logs)
+        except Exception as e:
+            print(f"[Warehouse] Failed to persist logs: {e}")
 
     return jsonify(
         {

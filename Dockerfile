@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     procps \
     gcc \
     g++ \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-arm64

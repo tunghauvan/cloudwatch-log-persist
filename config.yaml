@@ -1,5 +1,5 @@
 warehouse: file:///warehouse
-catalog: iceberg
+catalog: postgresql
 namespace: default
 table_name: cloudwatch_logs
 
@@ -19,3 +19,10 @@ compaction:
 partition:
   strategy: log_group
   log_group_buckets: 10
+
+database:
+  host: postgres
+  port: 5432
+  name: iceberg_db
+  user: admin
+  password: admin123
