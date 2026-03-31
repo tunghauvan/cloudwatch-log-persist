@@ -143,10 +143,12 @@ def _execute_query(execution: QueryExecution):
             print(f"[Query] filter_expr: {filter_expr}")
 
             limit = (
-                execution.parsed_query.get("limit", 1000)
+                execution.parsed_query.get("limit") or 1000
                 if execution.parsed_query
                 else 1000
             )
+            if limit < 1:
+                limit = 1000
             result = warehouse.query(filter_expr=filter_expr, limit=limit * 10)
 
             events = []

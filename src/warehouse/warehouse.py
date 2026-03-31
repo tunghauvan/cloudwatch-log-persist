@@ -265,6 +265,72 @@ class WarehouseManager:
             print(f"[Warehouse] Catalog check/repair failed: {e}")
             return False
 
+    def _repair_missing_data_files(self):
+        try:
+            table_path = self.get_table_path()
+            data_path = table_path / "data"
+
+            existing_files = set()
+            if data_path.exists():
+                for f in data_path.rglob("*.parquet"):
+                    existing_files.add(f.name)
+
+            if not existing_files:
+                print(f"[Warehouse] No data files exist, will reset table")
+                self._reset_table_for_missing_data()
+                return
+
+            print(f"[Warehouse] Found {len(existing_files)} data files on disk")
+            self._table = None
+
+        except Exception as e:
+            print(f"[Warehouse] Error repairing missing data files: {e}")
+            self._table = None
+
+    def _reset_table_for_missing_data(self):
+        try:
+            import psycopg2
+            import shutil
+
+            db_config = self.config.get("database", {})
+            conn = psycopg2.connect(
+                host=db_config.get("host", "localhost"),
+                port=db_config.get("port", 5432),
+                dbname=db_config.get("name", "iceberg_db"),
+                user=db_config.get("user", "admin"),
+                password=db_config.get("password", "admin123"),
+            )
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "DELETE FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
+                (self.namespace, self.table_name),
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            table_path = self.get_table_path()
+            data_path = table_path / "data"
+            metadata_dir = table_path / "metadata"
+
+            if data_path.exists():
+                shutil.rmtree(data_path)
+
+            if metadata_dir.exists():
+                for f in metadata_dir.glob("*.metadata.json"):
+                    f.unlink()
+
+            print(
+                f"[Warehouse] Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
+            )
+            self._table = None
+            self._catalog = None
+
+        except Exception as e:
+            print(f"[Warehouse] Error resetting table: {e}")
+            self._table = None
+
     def get_table_path(self, table_name: Optional[str] = None) -> Path:
         name = table_name or self.table_name
         return self._warehouse_dir / self.namespace / name
@@ -284,7 +350,31 @@ class WarehouseManager:
 
         if self._table is None:
             table_id = f"{self.namespace}.{self.table_name}"
-            self._table = self.catalog.load_table(table_id)
+            try:
+                self._table = self.catalog.load_table(table_id)
+            except Exception as e:
+                err_str = str(e).lower()
+                if (
+                    "not found" in err_str
+                    or "nosuch" in err_str
+                    or "does not exist" in err_str
+                ):
+                    print(
+                        f"[Warehouse] Table {table_id} not found, returning empty result"
+                    )
+                    import pyarrow as pa
+
+                    return pa.table(
+                        {
+                            "log_group_name": [],
+                            "log_stream_name": [],
+                            "timestamp": [],
+                            "message": [],
+                            "ingestion_time": [],
+                            "sequence_token": [],
+                        }
+                    )
+                raise
 
         import pyarrow as pa
 
@@ -319,13 +409,49 @@ class WarehouseManager:
 
         if self._table is None:
             table_id = f"{self.namespace}.{self.table_name}"
-            self._table = self.catalog.load_table(table_id)
+            try:
+                self._table = self.catalog.load_table(table_id)
+            except Exception as e:
+                if "not found" in str(e).lower() or "nosuch" in str(e).lower():
+                    print(
+                        f"[Warehouse] Table {table_id} not found, returning empty result"
+                    )
+                    import pyarrow as pa
 
-        scan = self._table.scan()
-        if filter_expr:
-            scan = scan.filter(filter_expr)
+                    return pa.table(
+                        {
+                            "log_group_name": [],
+                            "log_stream_name": [],
+                            "timestamp": [],
+                            "message": [],
+                            "ingestion_time": [],
+                            "sequence_token": [],
+                        }
+                    )
+                raise
 
-        result = scan.to_arrow()
+        try:
+            scan = self._table.scan()
+            if filter_expr:
+                scan = scan.filter(filter_expr)
+
+            result = scan.to_arrow()
+        except FileNotFoundError as e:
+            print(f"[Warehouse] Data file not found, rebuilding table: {e}")
+            self._repair_missing_data_files()
+            import pyarrow as pa
+
+            return pa.table(
+                {
+                    "log_group_name": [],
+                    "log_stream_name": [],
+                    "timestamp": [],
+                    "message": [],
+                    "ingestion_time": [],
+                    "sequence_token": [],
+                }
+            )
+
         if limit and len(result) > limit:
             result = result.slice(0, limit)
         return result
