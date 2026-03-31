@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify
 import time
 import re
 from cloudwatch_local_service.services.log_store import log_store
+from cloudwatch_local_service.routes.query_parser import parse_query
 
 query_bp = Blueprint("query", __name__)
 
@@ -28,6 +29,7 @@ class QueryExecution:
         self.status = "Running"
         self.results = []
         self.created_at = int(time.time() * 1000)
+        self.parsed_query = None
 
 
 query_executions = {}
@@ -39,21 +41,96 @@ def _get_warehouse():
     return warehouse
 
 
+def _apply_filter(event: dict, filters: list) -> bool:
+    for f in filters:
+        op = f[0]
+        field = f[1]
+        val = f[2] if len(f) > 2 else None
+
+        lookup_field = field.lstrip("@")
+        field_val = str(event.get(lookup_field, "")).lower()
+
+        if op == "like":
+            if val.lower() not in field_val:
+                return False
+        elif op == "regex":
+            import re
+
+            if not re.search(val, field_val):
+                return False
+        elif op == "not_like":
+            if val.lower() in field_val:
+                return False
+        elif op == "not_regex":
+            import re
+
+            if re.search(val, field_val):
+                return False
+        elif op == "cmp":
+            cmp_field = f[1]
+            cmp_op = f[2]
+            cmp_val = f[3]
+            cmp_lookup = cmp_field.lstrip("@")
+            try:
+                msg_val = str(event.get(cmp_lookup, "")).lower()
+                if cmp_op == "=":
+                    if cmp_val.lower() != msg_val:
+                        return False
+                elif cmp_op == "!=":
+                    if cmp_val.lower() == msg_val:
+                        return False
+                elif cmp_op == ">=":
+                    if not (msg_val >= cmp_val):
+                        return False
+                elif cmp_op == "<=":
+                    if not (msg_val <= cmp_val):
+                        return False
+                elif cmp_op == ">":
+                    if not (msg_val > cmp_val):
+                        return False
+                elif cmp_op == "<":
+                    if not (msg_val < cmp_val):
+                        return False
+            except (TypeError, ValueError):
+                return False
+        elif op == "in":
+            in_field = f[1]
+            in_vals = f[2]
+            in_lookup = in_field.lstrip("@")
+            field_val = str(event.get(in_lookup, "")).lower()
+            if field_val not in [v.lower() for v in in_vals]:
+                return False
+    return True
+
+
 def _execute_query(execution: QueryExecution):
     warehouse = _get_warehouse()
 
+    try:
+        execution.parsed_query = parse_query(execution.query_string)
+        print(f"[Query] Parsed CWL to SQL: {execution.parsed_query['sql']}")
+    except Exception as e:
+        print(f"[Query] Failed to parse CWL query: {e}")
+        execution.parsed_query = None
+
     if warehouse:
         try:
-            filter_expr = f"log_group_name == '{execution.log_group_name}'"
+            where_parts = [f"log_group_name == '{execution.log_group_name}'"]
 
             if execution.start_time:
-                filter_expr += f" AND timestamp >= {execution.start_time * 1000000}"
+                where_parts.append(f"timestamp >= {execution.start_time * 1000000}")
             if execution.end_time:
-                filter_expr += f" AND timestamp <= {execution.end_time * 1000000}"
+                where_parts.append(f"timestamp <= {execution.end_time * 1000000}")
 
+            filter_expr = " AND ".join(where_parts)
             print(f"[Query] filter_expr: {filter_expr}")
 
-            result = warehouse.query(filter_expr=filter_expr, limit=1000)
+            limit = (
+                execution.parsed_query.get("limit", 1000)
+                if execution.parsed_query
+                else 1000
+            )
+            result = warehouse.query(filter_expr=filter_expr, limit=limit * 10)
 
             events = []
             for i in range(result.num_rows):
@@ -61,10 +138,28 @@ def _execute_query(execution: QueryExecution):
                     col: result.column(col)[i].as_py() for col in result.column_names
                 }
                 events.append(row)
+            print(f"[Query] Warehouse returned {len(events)} events before CWL filter")
+
+            if execution.parsed_query and execution.parsed_query["filters"]:
+                cwl_filters = execution.parsed_query["filters"]
+                print(f"[Query] Applying {len(cwl_filters)} CWL filters: {cwl_filters}")
+                events = [e for e in events if _apply_filter(e, cwl_filters)]
+                print(f"[Query] After CWL filter: {len(events)} events")
+
+            if execution.parsed_query and execution.parsed_query["sort"]:
+                sort_field, sort_dir = execution.parsed_query["sort"]
+                print(f"[Query] Sorting by {sort_field} {sort_dir}")
+                reverse = sort_dir == "desc"
+                events.sort(key=lambda x: x.get(sort_field, ""), reverse=reverse)
+
+            events = events[:limit]
             print(f"[Query] query_string: {execution.query_string}")
-            print(f"[Query] Warehouse returned {len(events)} events")
+            print(f"[Query] Final result: {len(events)} events")
         except Exception as e:
             print(f"[Query] Warehouse query error: {e}")
+            import traceback
+
+            traceback.print_exc()
             events = []
     else:
         events = log_store.get_events(
@@ -75,69 +170,7 @@ def _execute_query(execution: QueryExecution):
         )
         print(f"[Query] Fallback to log_store: {len(events)} events")
 
-    query_string = execution.query_string.lower()
-    results = []
-
-    if (
-        "fields @timestamp, @message" in query_string
-        or "fields @message" in query_string
-    ):
-        limit_match = re.search(r"limit\s+(\d+)", query_string)
-        limit = int(limit_match.group(1)) if limit_match else 100
-
-        if "filter" in query_string:
-            filter_match = re.search(r"filter\s+(.+?)(?:\s*\|)", query_string)
-            if filter_match:
-                filter_expr = filter_match.group(1).strip()
-                if "like" in filter_expr:
-                    pattern_match = re.search(r"/(.+?)/", filter_expr)
-                    if pattern_match:
-                        pattern = pattern_match.group(1)
-                        events = [
-                            e
-                            for e in events
-                            if pattern.lower() in str(e.get("message", "")).lower()
-                        ]
-                elif "@message" in filter_expr:
-                    if "!=" in filter_expr:
-                        parts = filter_expr.split("!=")
-                        if len(parts) == 2:
-                            search_term = parts[1].strip().strip("\"'")
-                            events = [
-                                e
-                                for e in events
-                                if search_term.lower()
-                                not in str(e.get("message", "")).lower()
-                            ]
-                    elif "=" in filter_expr:
-                        parts = filter_expr.split("=")
-                        if len(parts) == 2:
-                            search_term = parts[1].strip().strip("\"'")
-                            events = [
-                                e
-                                for e in events
-                                if search_term.lower()
-                                in str(e.get("message", "")).lower()
-                            ]
-
-        results = events[:limit]
-        return results
-
-    elif "stats" in query_string:
-        if "count()" in query_string:
-            if "by bin" in query_string:
-                bin_match = re.search(r"bin\((\d+)([mhd])", query_string)
-                if bin_match:
-                    results = [
-                        {"timestamp": e.get("timestamp"), "count": 1}
-                        for e in events[:100]
-                    ]
-            else:
-                results = [{"count": len(events)}]
-        else:
-            results = [{"count": len(events)}]
-
-        return results
+    return events
 
 
 def execute_query_internal(
