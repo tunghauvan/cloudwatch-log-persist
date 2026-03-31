@@ -33,100 +33,39 @@ class QueryExecution:
 query_executions = {}
 
 
-@query_bp.route("/StartQuery", methods=["POST"])
-@query_bp.route("/StartQueryExecution", methods=["POST"])
-def start_query_execution():
-    data = request.get_json(force=True) or {}
-    log_group_name = data.get("logGroupName")
-    query_string = data.get("queryString", "")
-    start_time = data.get("startTime", int((time.time() - 3600) * 1000))
-    end_time = data.get("endTime", int(time.time() * 1000))
+def _get_warehouse():
+    from cloudwatch_local_service.server import warehouse
 
-    if not log_group_name or not query_string:
-        return jsonify(
-            {
-                "__type": "InvalidParameterException",
-                "message": "Missing required parameters",
-            }
-        ), 400
-
-    query_id = f"query-{int(time.time() * 1000)}"
-
-    execution = QueryExecution(
-        query_id, log_group_name, query_string, start_time, end_time
-    )
-    query_executions[query_id] = execution
-
-    results = _execute_query(execution)
-    execution.results = results
-    execution.status = "Complete"
-
-    return jsonify({"queryId": query_id})
-
-
-@query_bp.route("/GetQueryResults", methods=["POST"])
-@query_bp.route("/GetQuery", methods=["POST"])
-def get_query_results():
-    data = request.get_json(force=True) or {}
-    query_id = data.get("queryId")
-
-    if not query_id:
-        return jsonify(
-            {
-                "__type": "InvalidParameterException",
-                "message": "Missing queryId",
-            }
-        ), 400
-
-    if query_id not in query_executions:
-        return jsonify(
-            {
-                "__type": "ResourceNotFoundException",
-                "message": "Query not found",
-            }
-        ), 400
-
-    execution = query_executions[query_id]
-
-    return jsonify(
-        {
-            "queryId": query_id,
-            "status": execution.status,
-            "results": [
-                [
-                    {"field": "@timestamp", "value": str(r.get("timestamp", ""))},
-                    {"field": "@message", "value": r.get("message", "")},
-                ]
-                for r in execution.results
-            ],
-            "statistics": {
-                "recordsMatched": len(execution.results),
-                "recordsScanned": len(execution.results),
-                "bytesScanned": sum(
-                    len(str(r.get("message", ""))) for r in execution.results
-                ),
-            },
-        }
-    )
-
-
-@query_bp.route("/start-query", methods=["POST"])
-def start_query_execution_alt():
-    return start_query_execution()
-
-
-@query_bp.route("/get-query-results", methods=["POST"])
-def get_query_results_alt():
-    return get_query_results()
+    return warehouse
 
 
 def _execute_query(execution: QueryExecution):
-    events = log_store.get_events(
-        log_group_name=execution.log_group_name,
-        start_time=execution.start_time,
-        end_time=execution.end_time,
-        limit=1000,
-    )
+    warehouse = _get_warehouse()
+
+    if warehouse:
+        try:
+            filter_expr = f"log_group_name == '{execution.log_group_name}'"
+
+            result = warehouse.query(filter_expr=filter_expr, limit=1000)
+
+            events = []
+            for i in range(result.num_rows):
+                row = {
+                    col: result.column(col)[i].as_py() for col in result.column_names
+                }
+                events.append(row)
+            print(f"[Query] Warehouse returned {len(events)} events")
+        except Exception as e:
+            print(f"[Query] Warehouse query error: {e}")
+            events = []
+    else:
+        events = log_store.get_events(
+            log_group_name=execution.log_group_name,
+            start_time=execution.start_time,
+            end_time=execution.end_time,
+            limit=1000,
+        )
+        print(f"[Query] Fallback to log_store: {len(events)} events")
 
     query_string = execution.query_string.lower()
     results = []
@@ -149,7 +88,7 @@ def _execute_query(execution: QueryExecution):
                         events = [
                             e
                             for e in events
-                            if pattern.lower() in e.get("message", "").lower()
+                            if pattern.lower() in str(e.get("message", "")).lower()
                         ]
                 elif "@message" in filter_expr:
                     if "=" in filter_expr:
@@ -159,10 +98,12 @@ def _execute_query(execution: QueryExecution):
                             events = [
                                 e
                                 for e in events
-                                if search_term.lower() in e.get("message", "").lower()
+                                if search_term.lower()
+                                in str(e.get("message", "")).lower()
                             ]
 
         results = events[:limit]
+        return results
 
     elif "stats" in query_string:
         if "count()" in query_string:
@@ -178,4 +119,60 @@ def _execute_query(execution: QueryExecution):
         else:
             results = [{"count": len(events)}]
 
-    return results
+        return results
+
+
+def execute_query_internal(
+    log_group_name: str, query_string: str, start_time: int, end_time: int
+):
+    query_id = f"query-{int(time.time() * 1000)}"
+
+    execution = QueryExecution(
+        query_id, log_group_name, query_string, start_time, end_time
+    )
+    query_executions[query_id] = execution
+
+    results = _execute_query(execution)
+    execution.results = results
+    execution.status = "Complete"
+
+    return {"queryId": query_id}
+
+
+def get_query_results_internal(query_id: str):
+    if not query_id or query_id not in query_executions:
+        return {
+            "__type": "ResourceNotFoundException",
+            "message": "Query not found",
+        }
+
+    execution = query_executions[query_id]
+    results = execution.results or []
+
+    if results and "count" in results[0]:
+        formatted_results = [
+            [
+                {"field": "@ptr", "value": ""},
+                {"field": "count()", "value": str(r.get("count", 0))},
+            ]
+            for r in results
+        ]
+    else:
+        formatted_results = [
+            [
+                {"field": "@timestamp", "value": str(r.get("timestamp", ""))},
+                {"field": "@message", "value": r.get("message", "")},
+            ]
+            for r in results
+        ]
+
+    return {
+        "queryId": query_id,
+        "status": execution.status,
+        "results": formatted_results,
+        "statistics": {
+            "recordsMatched": len(results),
+            "recordsScanned": len(results),
+            "bytesScanned": sum(len(str(r.get("message", ""))) for r in results),
+        },
+    }

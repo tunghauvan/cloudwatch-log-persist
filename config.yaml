@@ -12,9 +12,13 @@ spark:
   master: local[*]
 
 compaction:
+  enabled: false
+  interval_seconds: 300
+  max_data_files: 50
+
+retention:
   enabled: true
-  interval_seconds: 10
-  max_log_lines: 10000
+  days: 7
 
 partition:
   strategy: log_group

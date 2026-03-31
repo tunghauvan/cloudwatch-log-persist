@@ -1,11 +1,11 @@
 import os
 import sys
+import time
 from pathlib import Path
 from flask import Flask, request, jsonify
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cloudwatch_local_service.services.file_storage import FileStorage
 from cloudwatch_local_service.routes.logs import logs_bp
 from cloudwatch_local_service.routes.groups import groups_bp
 from cloudwatch_local_service.routes.streams import streams_bp
@@ -14,11 +14,6 @@ from cloudwatch_local_service.routes.store import store_bp
 
 app = Flask(__name__)
 
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "./logs"))
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-file_storage = FileStorage(LOGS_DIR)
-
 config_path = Path(os.getenv("CONFIG_PATH", "/app/config.yaml"))
 warehouse = None
 try:
@@ -26,9 +21,12 @@ try:
 
     warehouse = WarehouseManager(str(config_path))
     warehouse.ensure_warehouse()
+    warehouse.start_maintenance()
+    stats = warehouse.get_stats()
     print(
         f"[Warehouse] Initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}"
     )
+    print(f"[Warehouse] Stats: {stats}")
 except Exception as e:
     print(f"[Warehouse] Failed to initialize: {e}")
 
@@ -88,16 +86,19 @@ def handle_request():
         return put_log_events()
 
 
-def describe_log_groups():
-    from cloudwatch_local_service.services.log_store import log_store
+def get_warehouse():
+    return warehouse
 
-    groups = log_store.get_all_log_groups()
-    return jsonify({"logGroups": list(groups.values())})
+
+def describe_log_groups():
+    wh = get_warehouse()
+    if wh:
+        groups = wh.get_log_groups()
+        return jsonify({"logGroups": list(groups.values())})
+    return jsonify({"logGroups": []})
 
 
 def describe_log_streams():
-    from cloudwatch_local_service.services.log_store import log_store
-
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         log_group_name = data.get("logGroupName")
@@ -109,8 +110,11 @@ def describe_log_streams():
             {"__type": "InvalidParameterException", "message": "Missing logGroupName"}
         ), 400
 
-    streams = log_store.get_log_streams(log_group_name)
-    return jsonify({"logStreams": streams})
+    wh = get_warehouse()
+    if wh:
+        streams = wh.get_log_streams(log_group_name)
+        return jsonify({"logStreams": streams})
+    return jsonify({"logStreams": []})
 
 
 def put_log_events():
@@ -150,8 +154,6 @@ def put_log_events():
     )
     next_token = str(new_sequence)
 
-    file_storage.save_logs(log_group_name, log_stream_name, log_events, ingestion_time)
-
     if warehouse:
         try:
             warehouse_logs = [
@@ -182,8 +184,6 @@ def put_log_events():
 
 
 def get_log_events():
-    from cloudwatch_local_service.services.log_store import log_store
-
     if request.method == "POST":
         data = request.get_json(force=True)
         log_group_name = data.get("logGroupName")
@@ -213,13 +213,17 @@ def get_log_events():
             }
         ), 400
 
-    events = log_store.get_events(
-        log_group_name=log_group_name,
-        log_stream_name=log_stream_name,
-        start_time=start_time,
-        end_time=end_time,
-        limit=limit,
-    )
+    wh = get_warehouse()
+    if wh:
+        events = wh.get_logs(
+            log_group_name=log_group_name,
+            log_stream_name=log_stream_name,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+    else:
+        events = []
 
     return jsonify(
         {
@@ -238,8 +242,6 @@ def get_log_events():
 
 
 def filter_log_events():
-    from cloudwatch_local_service.services.log_store import log_store
-
     data = request.get_json(force=True) or {}
     log_group_name = data.get("logGroupName")
     log_stream_name_prefix = data.get("logStreamNamePrefix")
@@ -261,14 +263,21 @@ def filter_log_events():
             }
         ), 400
 
-    events = log_store.filter_events(
-        log_group_name=log_group_name,
-        log_stream_name_prefix=log_stream_name_prefix,
-        filter_pattern=filter_pattern,
-        start_time=start_time,
-        end_time=end_time,
-        limit=limit,
-    )
+    wh = get_warehouse()
+    if wh:
+        events = wh.get_logs(
+            log_group_name=log_group_name,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+    else:
+        events = []
+
+    if filter_pattern:
+        events = [
+            e for e in events if filter_pattern.lower() in e.get("message", "").lower()
+        ]
 
     return jsonify(
         {
@@ -285,17 +294,27 @@ def filter_log_events():
 
 
 def start_query_execution():
-    from cloudwatch_local_service.routes.query import (
-        start_query_execution as start_query,
-    )
+    from cloudwatch_local_service.routes.query import execute_query_internal
 
-    return start_query()
+    data = request.get_json(force=True) or {}
+    log_group_name = data.get("logGroupName")
+    query_string = data.get("queryString", "")
+    start_time = data.get("startTime", int((time.time() - 3600) * 1000))
+    end_time = data.get("endTime", int(time.time() * 1000))
+    return jsonify(
+        execute_query_internal(log_group_name, query_string, start_time, end_time)
+    )
 
 
 def get_query_execution_results():
-    from cloudwatch_local_service.routes.query import get_query_results as get_results
+    from cloudwatch_local_service.routes.query import get_query_results_internal
 
-    return get_results()
+    data = request.get_json(force=True) or {}
+    query_id = data.get("queryId")
+    result = get_query_results_internal(query_id)
+    if "error" in result or result.get("__type") == "ResourceNotFoundException":
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 if __name__ == "__main__":
