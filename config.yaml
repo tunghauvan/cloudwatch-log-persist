@@ -11,8 +11,12 @@ spark:
   app_name: CloudWatchLogPersist
   master: local[*]
 
+buffer:
+  max_size: 50000
+  flush_interval_seconds: 10
+
 compaction:
-  enabled: false
+  enabled: true
   interval_seconds: 300
   max_data_files: 50
 

@@ -16,17 +16,43 @@ app = Flask(__name__)
 
 config_path = Path(os.getenv("CONFIG_PATH", "/app/config.yaml"))
 warehouse = None
+log_buffer = None
+
+try:
+    import yaml
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+except Exception as e:
+    print(f"[Config] Failed to load: {e}")
+    config = {}
+
+buffer_config = config.get("buffer", {})
+buffer_max_size = buffer_config.get("max_size", 50000)
+buffer_flush_interval = buffer_config.get("flush_interval_seconds", 10)
+
 try:
     from warehouse.warehouse import WarehouseManager
+    from cloudwatch_local_service.services.log_buffer import LogBuffer
 
     warehouse = WarehouseManager(str(config_path))
     warehouse.ensure_warehouse()
     warehouse.start_maintenance()
+
+    log_buffer = LogBuffer(
+        max_size=buffer_max_size, flush_interval_seconds=buffer_flush_interval
+    )
+    log_buffer.set_warehouse(warehouse)
+    log_buffer.start()
+
     stats = warehouse.get_stats()
     print(
         f"[Warehouse] Initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}"
     )
     print(f"[Warehouse] Stats: {stats}")
+    print(
+        f"[Buffer] max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s"
+    )
 except Exception as e:
     print(f"[Warehouse] Failed to initialize: {e}")
 
@@ -39,7 +65,10 @@ app.register_blueprint(store_bp)
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "cloudwatch-logs-local"})
+    response = {"status": "ok", "service": "cloudwatch-logs-local"}
+    if log_buffer:
+        response["buffer"] = log_buffer.stats()
+    return jsonify(response)
 
 
 @app.route("/", methods=["GET", "POST", "PUT"])
@@ -165,7 +194,7 @@ def put_log_events():
     )
     next_token = str(new_sequence)
 
-    if warehouse:
+    if warehouse and log_buffer:
         try:
             warehouse_logs = [
                 {
@@ -178,9 +207,9 @@ def put_log_events():
                 }
                 for event in log_events
             ]
-            warehouse.insert_logs(warehouse_logs)
+            log_buffer.add(warehouse_logs)
         except Exception as e:
-            print(f"[Warehouse] Failed to persist logs: {e}")
+            print(f"[Warehouse] Failed to buffer logs: {e}")
 
     return jsonify(
         {
@@ -338,5 +367,31 @@ def get_query_execution_results():
     return jsonify(result)
 
 
+@app.route("/flush", methods=["POST"])
+def flush_buffer():
+    if log_buffer:
+        count = log_buffer.flush()
+        return jsonify({"status": "ok", "flushed": count})
+    return jsonify({"status": "ok", "flushed": 0})
+
+
+@app.route("/buffer/stats", methods=["GET"])
+def buffer_stats():
+    if log_buffer:
+        return jsonify(log_buffer.stats())
+    return jsonify({"error": "buffer not initialized"})
+
+
+def shutdown():
+    print("[Server] Shutting down...")
+    if log_buffer:
+        print(f"[Server] Flushing buffer ({log_buffer.size()} logs)...")
+        log_buffer.stop()
+        print("[Server] Buffer flushed")
+
+
 if __name__ == "__main__":
+    import atexit
+
+    atexit.register(shutdown)
     app.run(host="0.0.0.0", port=4588, debug=True)
