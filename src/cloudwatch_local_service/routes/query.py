@@ -46,6 +46,13 @@ def _execute_query(execution: QueryExecution):
         try:
             filter_expr = f"log_group_name == '{execution.log_group_name}'"
 
+            if execution.start_time:
+                filter_expr += f" AND timestamp >= {execution.start_time * 1000000}"
+            if execution.end_time:
+                filter_expr += f" AND timestamp <= {execution.end_time * 1000000}"
+
+            print(f"[Query] filter_expr: {filter_expr}")
+
             result = warehouse.query(filter_expr=filter_expr, limit=1000)
 
             events = []
@@ -54,6 +61,7 @@ def _execute_query(execution: QueryExecution):
                     col: result.column(col)[i].as_py() for col in result.column_names
                 }
                 events.append(row)
+            print(f"[Query] query_string: {execution.query_string}")
             print(f"[Query] Warehouse returned {len(events)} events")
         except Exception as e:
             print(f"[Query] Warehouse query error: {e}")
@@ -78,9 +86,9 @@ def _execute_query(execution: QueryExecution):
         limit = int(limit_match.group(1)) if limit_match else 100
 
         if "filter" in query_string:
-            filter_match = re.search(r"filter\s+(.+?)(?:\s+|$)", query_string)
+            filter_match = re.search(r"filter\s+(.+?)(?:\s*\|)", query_string)
             if filter_match:
-                filter_expr = filter_match.group(1)
+                filter_expr = filter_match.group(1).strip()
                 if "like" in filter_expr:
                     pattern_match = re.search(r"/(.+?)/", filter_expr)
                     if pattern_match:
@@ -91,10 +99,20 @@ def _execute_query(execution: QueryExecution):
                             if pattern.lower() in str(e.get("message", "")).lower()
                         ]
                 elif "@message" in filter_expr:
-                    if "=" in filter_expr:
+                    if "!=" in filter_expr:
+                        parts = filter_expr.split("!=")
+                        if len(parts) == 2:
+                            search_term = parts[1].strip().strip("\"'")
+                            events = [
+                                e
+                                for e in events
+                                if search_term.lower()
+                                not in str(e.get("message", "")).lower()
+                            ]
+                    elif "=" in filter_expr:
                         parts = filter_expr.split("=")
                         if len(parts) == 2:
-                            search_term = parts[1].strip().strip('"')
+                            search_term = parts[1].strip().strip("\"'")
                             events = [
                                 e
                                 for e in events
@@ -158,13 +176,22 @@ def get_query_results_internal(query_id: str):
             for r in results
         ]
     else:
-        formatted_results = [
-            [
-                {"field": "@timestamp", "value": str(r.get("timestamp", ""))},
-                {"field": "@message", "value": r.get("message", "")},
-            ]
-            for r in results
-        ]
+        formatted_results = []
+        for r in results:
+            ts = r.get("timestamp")
+            if hasattr(ts, "timestamp"):
+                # datetime object - convert to milliseconds
+                ts_int = int(ts.timestamp() * 1000)
+            elif isinstance(ts, (int, float)):
+                ts_int = int(ts)
+            else:
+                ts_int = ts
+            formatted_results.append(
+                [
+                    {"field": "@timestamp", "value": str(ts_int)},
+                    {"field": "@message", "value": r.get("message", "")},
+                ]
+            )
 
     return {
         "queryId": query_id,

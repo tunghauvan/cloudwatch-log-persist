@@ -44,6 +44,17 @@ def health():
 
 @app.route("/", methods=["GET", "POST", "PUT"])
 def handle_request():
+    print(f"\n{'=' * 60}")
+    print(f"[Request] Method: {request.method}")
+    print(f"[Request] Headers: {dict(request.headers)}")
+    print(f"[Request] Args: {dict(request.args)}")
+    if request.method == "POST":
+        try:
+            print(f"[Request] Body: {request.get_json(force=True)}")
+        except:
+            print(f"[Request] Body: (could not parse)")
+    print(f"{'=' * 60}\n")
+
     amz_target = request.headers.get("X-Amz-Target", "")
 
     if amz_target:
@@ -297,10 +308,20 @@ def start_query_execution():
     from cloudwatch_local_service.routes.query import execute_query_internal
 
     data = request.get_json(force=True) or {}
-    log_group_name = data.get("logGroupName")
+
+    # Handle both logGroupName (string) and logGroupNames (array from Grafana)
+    log_group_names = data.get("logGroupNames")
+    if log_group_names and isinstance(log_group_names, list):
+        log_group_name = log_group_names[0]
+    else:
+        log_group_name = data.get("logGroupName")
+
     query_string = data.get("queryString", "")
     start_time = data.get("startTime", int((time.time() - 3600) * 1000))
     end_time = data.get("endTime", int(time.time() * 1000))
+
+    print(f"[Query] Using log_group_name: {log_group_name}")
+
     return jsonify(
         execute_query_internal(log_group_name, query_string, start_time, end_time)
     )
