@@ -43,63 +43,80 @@ def _get_warehouse():
 
 def _apply_filter(event: dict, filters: list) -> bool:
     for f in filters:
-        op = f[0]
-        field = f[1]
-        val = f[2] if len(f) > 2 else None
+        if not _evaluate_filter(event, f):
+            return False
+    return True
 
-        lookup_field = field.lstrip("@")
-        field_val = str(event.get(lookup_field, "")).lower()
 
-        if op == "like":
-            if val.lower() not in field_val:
-                return False
-        elif op == "regex":
-            import re
+def _evaluate_filter(event: dict, f) -> bool:
+    if not isinstance(f, (list, tuple)):
+        return True
 
-            if not re.search(val, field_val):
-                return False
-        elif op == "not_like":
-            if val.lower() in field_val:
-                return False
-        elif op == "not_regex":
-            import re
+    op = f[0]
 
-            if re.search(val, field_val):
-                return False
-        elif op == "cmp":
-            cmp_field = f[1]
-            cmp_op = f[2]
-            cmp_val = f[3]
-            cmp_lookup = cmp_field.lstrip("@")
-            try:
-                msg_val = str(event.get(cmp_lookup, "")).lower()
-                if cmp_op == "=":
-                    if cmp_val.lower() != msg_val:
-                        return False
-                elif cmp_op == "!=":
-                    if cmp_val.lower() == msg_val:
-                        return False
-                elif cmp_op == ">=":
-                    if not (msg_val >= cmp_val):
-                        return False
-                elif cmp_op == "<=":
-                    if not (msg_val <= cmp_val):
-                        return False
-                elif cmp_op == ">":
-                    if not (msg_val > cmp_val):
-                        return False
-                elif cmp_op == "<":
-                    if not (msg_val < cmp_val):
-                        return False
-            except (TypeError, ValueError):
-                return False
-        elif op == "in":
-            in_field = f[1]
-            in_vals = f[2]
-            in_lookup = in_field.lstrip("@")
-            field_val = str(event.get(in_lookup, "")).lower()
-            if field_val not in [v.lower() for v in in_vals]:
-                return False
+    if op == "and":
+        return _evaluate_filter(event, f[1]) and _evaluate_filter(event, f[2])
+
+    if op == "or":
+        return _evaluate_filter(event, f[1]) or _evaluate_filter(event, f[2])
+
+    if op == "not":
+        return not _evaluate_filter(event, f[1])
+
+    if op not in ("like", "regex", "not_like", "not_regex", "cmp", "in"):
+        return True
+
+    field = f[1]
+    val = f[2] if len(f) > 2 else None
+
+    lookup_field = field.lstrip("@") if isinstance(field, str) else field
+    field_val = str(event.get(lookup_field, ""))
+
+    if op == "like":
+        return val.lower() in field_val.lower()
+
+    elif op == "regex":
+        import re
+
+        return bool(re.search(val, field_val))
+
+    elif op == "not_like":
+        return val.lower() not in field_val.lower()
+
+    elif op == "not_regex":
+        import re
+
+        return not bool(re.search(val, field_val))
+
+    elif op == "cmp":
+        cmp_field = f[1]
+        cmp_op = f[2]
+        cmp_val = f[3]
+        cmp_lookup = cmp_field.lstrip("@") if isinstance(cmp_field, str) else cmp_field
+        try:
+            msg_val = str(event.get(cmp_lookup, ""))
+            if cmp_op == "=":
+                return cmp_val.lower() == msg_val.lower()
+            elif cmp_op == "!=":
+                return cmp_val.lower() != msg_val.lower()
+            elif cmp_op == ">=":
+                return msg_val >= cmp_val
+            elif cmp_op == "<=":
+                return msg_val <= cmp_val
+            elif cmp_op == ">":
+                return msg_val > cmp_val
+            elif cmp_op == "<":
+                return msg_val < cmp_val
+        except (TypeError, ValueError):
+            return False
+
+    elif op == "in":
+        in_field = f[1]
+        in_vals = f[2]
+        in_lookup = in_field.lstrip("@") if isinstance(in_field, str) else in_field
+        field_val = str(event.get(in_lookup, ""))
+        return field_val in in_vals
+
     return True
 
 
