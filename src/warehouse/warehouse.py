@@ -311,15 +311,8 @@ class WarehouseManager:
             conn.close()
 
             table_path = self.get_table_path()
-            data_path = table_path / "data"
-            metadata_dir = table_path / "metadata"
-
-            if data_path.exists():
-                shutil.rmtree(data_path)
-
-            if metadata_dir.exists():
-                for f in metadata_dir.glob("*.metadata.json"):
-                    f.unlink()
+            if table_path.exists():
+                shutil.rmtree(table_path)
 
             print(
                 f"[Warehouse] Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
