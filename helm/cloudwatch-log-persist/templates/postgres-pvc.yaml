@@ -1,0 +1,18 @@
+{{- if and .Values.postgres.enabled .Values.postgres.primary.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cloudwatch-log-persist.fullname" . }}-postgres-pvc
+  labels:
+    {{- include "cloudwatch-log-persist.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.postgres.primary.persistence.size }}
+  {{- if .Values.postgres.primary.persistence.storageClass }}
+  storageClassName: {{ .Values.postgres.primary.persistence.storageClass }}
+  {{- end }}
+{{- end }}

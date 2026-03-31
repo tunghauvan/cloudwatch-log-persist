@@ -1,0 +1,45 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }}
+  $ helm get all {{ .Release.Name }}
+
+== CloudWatch Log Persist ==
+
+The CloudWatch Local Service is now running.
+
+{{- if .Values.cloudwatchService.enabled }}
+CloudWatch Service:
+  URL: http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}
+
+{{- if eq .Values.cloudwatchService.service.type "LoadBalancer" }}
+  External URL: http://$(kubectl get svc {{ include "cloudwatch-log-persist.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+{{- end }}
+{{- end }}
+
+{{- if .Values.postgres.enabled }}
+PostgreSQL (Iceberg Catalog):
+  Host: {{ include "cloudwatch-log-persist.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local
+  Port: 5432
+  Database: {{ .Values.postgres.auth.database }}
+  User: {{ .Values.postgres.auth.username }}
+{{- end }}
+
+== Configuration ==
+
+To update configuration, edit the configmap:
+  $ kubectl edit configmap {{ include "cloudwatch-log-persist.fullname" . }}-config -n {{ .Release.Namespace }}
+
+== Testing ==
+
+To test the service, run:
+  $ kubectl exec -it $(kubectl get pods -l app.kubernetes.io/name=cloudwatch-log-persist -o jsonpath='{.items[0].metadata.name}') -- python -c "
+import requests
+resp = requests.post('http://localhost:4588/', 
+    headers={'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': 'Logs_20140328.DescribeLogGroups'},
+    data='{}')
+print(resp.json())
+"

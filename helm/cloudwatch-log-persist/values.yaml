@@ -1,0 +1,92 @@
+replicaCount: 1
+
+image:
+  repository: cloudwatch-log-persist
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 4588
+
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "15"
+    pullPolicy: IfNotPresent
+  auth:
+    database: iceberg_db
+    username: admin
+    password: admin123
+  primary:
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    healthcheck:
+      enabled: true
+
+cloudwatchService:
+  enabled: true
+  image:
+    repository: cloudwatch-log-persist
+    tag: latest
+    pullPolicy: IfNotPresent
+  config:
+    warehouse: file:///warehouse
+    catalog: postgresql
+    namespace: default
+    table_name: cloudwatch_logs
+    database:
+      host: postgres-release
+      port: 5432
+      name: iceberg_db
+      user: admin
+      password: admin123
+    compaction:
+      enabled: true
+      interval_seconds: 300
+      max_data_files: 50
+      target_file_size_mb: 128
+    retention:
+      enabled: true
+      days: 7
+    buffer:
+      max_size: 50000
+      flush_interval_seconds: 10
+  persistence:
+    enabled: false
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  service:
+    type: LoadBalancer
+    port: 4588
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: cloudwatch.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+volumePermissions:
+  enabled: true
