@@ -112,13 +112,14 @@ def get_log_events():
         limit=limit,
     )
 
+    print(f"[Debug] Returning events. First event timestamp: {events[0]['timestamp'] if events else 'None'}")
     return jsonify(
         {
             "events": [
                 {
-                    "timestamp": e["timestamp"],
+                    "timestamp": int(e["timestamp"] / 1000) if "timestamp" in e else 0,
                     "message": e["message"],
-                    "ingestionTime": e["ingestionTime"],
+                    "ingestionTime": int(e["ingestionTime"] / 1000) if "ingestionTime" in e else 0,
                 }
                 for e in events
             ],

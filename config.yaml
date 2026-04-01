@@ -13,7 +13,7 @@ spark:
 
 buffer:
   max_size: 50000
-  flush_interval_seconds: 10
+  flush_interval_seconds: 60
 
 compaction:
   enabled: true
@@ -34,3 +34,20 @@ database:
   name: iceberg_db
   user: admin
   password: admin123
+
+ingest:
+  http:
+    enabled: true
+    path: /ingest/logs
+  labels:
+    enabled: true
+    columns:
+      - env
+      - service
+      - host
+      - region
+      - app
+      - pod
+      - container
+      - level
+      - namespace

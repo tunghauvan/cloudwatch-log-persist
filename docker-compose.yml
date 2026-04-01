@@ -35,5 +35,35 @@ services:
         condition: service_healthy
     command: ["python", "-m", "flask", "--app", "cloudwatch_local_service.server", "run", "--host", "0.0.0.0", "--port", "4588"]
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - 3000:3000
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - cloudwatch-local-service
+
+  fluentbit:
+    image: python:3.11-slim
+    container_name: fluentbit-simulator
+    volumes:
+      - ./fluentbit/log-simulator.py:/app/log-simulator.py
+    working_dir: /app
+    depends_on:
+      - cloudwatch-local-service
+    command: ["sh", "-c", "pip install requests && python log-simulator.py"]
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  grafana_data:

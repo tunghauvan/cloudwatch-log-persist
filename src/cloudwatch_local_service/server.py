@@ -11,6 +11,8 @@ from cloudwatch_local_service.routes.groups import groups_bp
 from cloudwatch_local_service.routes.streams import streams_bp
 from cloudwatch_local_service.routes.query import query_bp
 from cloudwatch_local_service.routes.store import store_bp
+from cloudwatch_local_service.routes.ingest import ingest_bp
+from cloudwatch_local_service.routes.loki import loki_bp
 
 app = Flask(__name__)
 
@@ -61,6 +63,8 @@ app.register_blueprint(groups_bp)
 app.register_blueprint(streams_bp)
 app.register_blueprint(query_bp)
 app.register_blueprint(store_bp)
+app.register_blueprint(ingest_bp)
+app.register_blueprint(loki_bp)
 
 
 @app.route("/", methods=["GET"])

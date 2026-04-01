@@ -45,7 +45,7 @@ class LogBuffer:
     def add(self, logs: List[Dict[str, Any]]):
         with self._lock:
             self._buffer.extend(logs)
-            self._last_flush_time = time.time()
+            # Don't reset _last_flush_time here - let it be reset only on actual flush
 
         if len(self._buffer) >= self.max_size:
             try:

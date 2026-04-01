@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://cloudwatch-local-service:4588
+    isDefault: true
+    editable: true
+    jsonData:
+      timeout: 60
+      httpHeaderName1: X-Scope-OrgID
+    secureJsonData:
+      httpHeaderValue1: "1"
+    version: 1

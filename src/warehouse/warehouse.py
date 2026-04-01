@@ -2,6 +2,7 @@ import os
 import yaml
 import time
 import threading
+import pandas as pd
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -157,14 +158,30 @@ class WarehouseManager:
         return self._catalog
 
     def _get_schema(self) -> Schema:
-        return Schema(
+        ingest_config = self.config.get("ingest", {})
+        labels_config = ingest_config.get("labels", {})
+        label_columns = labels_config.get("columns", [])
+
+        fields = [
             NestedField(1, "log_group_name", StringType(), required=False),
             NestedField(2, "log_stream_name", StringType(), required=False),
             NestedField(3, "timestamp", TimestampType(), required=False),
             NestedField(4, "message", StringType(), required=False),
             NestedField(5, "ingestion_time", TimestampType(), required=False),
             NestedField(6, "sequence_token", LongType(), required=False),
-        )
+        ]
+
+        field_id = 7
+        for label in label_columns:
+            safe_name = label.replace("-", "_").replace(" ", "_")
+            fields.append(
+                NestedField(
+                    field_id, f"label_{safe_name}", StringType(), required=False
+                )
+            )
+            field_id += 1
+
+        return Schema(*fields)
 
     def _get_partition_spec(self) -> PartitionSpec:
         return PartitionSpec(
@@ -324,6 +341,12 @@ class WarehouseManager:
             print(f"[Warehouse] Error resetting table: {e}")
             self._table = None
 
+    def _get_label_columns(self) -> List[str]:
+        ingest_config = self.config.get("ingest", {})
+        labels_config = ingest_config.get("labels", {})
+        label_columns = labels_config.get("columns", [])
+        return [col.replace("-", "_").replace(" ", "_") for col in label_columns]
+
     def get_table_path(self, table_name: Optional[str] = None) -> Path:
         name = table_name or self.table_name
         return self._warehouse_dir / self.namespace / name
@@ -371,79 +394,97 @@ class WarehouseManager:
 
         import pyarrow as pa
 
+        label_columns = self._get_label_columns()
+
+        def convert_timestamp(ts):
+            """Convert various timestamp formats to datetime64[us]"""
+            if ts is None:
+                return None
+            if isinstance(ts, int) or isinstance(ts, float):
+                ts = int(ts)
+                # Detect timestamp unit based on magnitude
+                if ts > 1_000_000_000_000_000_000:  # nanoseconds
+                    ts_seconds = ts / 1_000_000_000.0
+                elif ts > 1_000_000_000_000_000:  # microseconds
+                    ts_seconds = ts / 1_000_000.0
+                elif ts > 1_000_000_000_000:  # milliseconds
+                    ts_seconds = ts / 1_000.0
+                elif ts > 1_000_000_000:  # seconds
+                    ts_seconds = float(ts)
+                else:
+                    ts_seconds = float(ts)
+                
+                return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).replace(
+                    tzinfo=None
+                )
+            return ts
+
         arrays = [
             pa.array([log.get("logGroupName", "") for log in logs]),
             pa.array([log.get("logStreamName", "") for log in logs]),
-            pa.array([log.get("timestamp") for log in logs], type=pa.timestamp("us")),
+            pa.array(
+                [convert_timestamp(log.get("timestamp")) for log in logs],
+                type=pa.timestamp("us"),
+            ),
             pa.array([log.get("message", "") for log in logs]),
             pa.array(
-                [log.get("ingestionTime") for log in logs], type=pa.timestamp("us")
+                [convert_timestamp(log.get("ingestionTime")) for log in logs],
+                type=pa.timestamp("us"),
             ),
             pa.array([log.get("sequenceToken") for log in logs], type=pa.int64()),
         ]
 
-        table = pa.table(
-            arrays,
-            names=[
-                "log_group_name",
-                "log_stream_name",
-                "timestamp",
-                "message",
-                "ingestion_time",
-                "sequence_token",
-            ],
-        )
+        names = [
+            "log_group_name",
+            "log_stream_name",
+            "timestamp",
+            "message",
+            "ingestion_time",
+            "sequence_token",
+        ]
 
+        for label_col in label_columns:
+            arrays.append(pa.array([log.get(f"label_{label_col}", "") for log in logs]))
+            names.append(f"label_{label_col}")
+
+        table = pa.table(arrays, names=names)
+        print(f"[Warehouse] Inserting {len(logs)} logs to table {self.table_name}")
         self._table.append(table)
 
     def query(self, filter_expr: Optional[str] = None, limit: int = 100):
         if not PYICEBERG_AVAILABLE:
             raise RuntimeError("PyIceberg is not installed")
 
-        if self._table is None:
-            table_id = f"{self.namespace}.{self.table_name}"
-            try:
-                self._table = self.catalog.load_table(table_id)
-            except Exception as e:
-                if "not found" in str(e).lower() or "nosuch" in str(e).lower():
-                    print(
-                        f"[Warehouse] Table {table_id} not found, returning empty result"
-                    )
-                    import pyarrow as pa
-
-                    return pa.table(
-                        {
-                            "log_group_name": [],
-                            "log_stream_name": [],
-                            "timestamp": [],
-                            "message": [],
-                            "ingestion_time": [],
-                            "sequence_token": [],
-                        }
-                    )
-                raise
+        # Always reload table to get fresh data files
+        table_id = f"{self.namespace}.{self.table_name}"
+        try:
+            self._table = self.catalog.load_table(table_id)
+        except Exception as e:
+            if "not found" in str(e).lower() or "nosuch" in str(e).lower():
+                print(f"[Warehouse] Table {table_id} not found, returning empty result")
+                import pyarrow as pa
+                return pa.table({
+                    "log_group_name": [], "log_stream_name": [], "timestamp": [],
+                    "message": [], "ingestion_time": [], "sequence_token": [],
+                })
+            raise
 
         try:
+            print(f"[Warehouse] Running query with filter: {filter_expr}")
             scan = self._table.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
 
             result = scan.to_arrow()
+            print(f"[Warehouse] Query returned {len(result)} rows")
         except FileNotFoundError as e:
             print(f"[Warehouse] Data file not found, rebuilding table: {e}")
             self._repair_missing_data_files()
             import pyarrow as pa
-
-            return pa.table(
-                {
-                    "log_group_name": [],
-                    "log_stream_name": [],
-                    "timestamp": [],
-                    "message": [],
-                    "ingestion_time": [],
-                    "sequence_token": [],
-                }
-            )
+            return pa.table({
+                "log_group_name": [], "log_stream_name": [], "timestamp": [],
+                "message": [], "ingestion_time": [], "sequence_token": [],
+            })
 
         if limit and len(result) > limit:
             result = result.slice(0, limit)
@@ -503,108 +544,84 @@ class WarehouseManager:
         end_time: Optional[int] = None,
         limit: int = 100,
     ):
-        filter_expr = f"log_group_name == '{log_group_name}'"
+        filter_expr_parts = []
+        if log_group_name:
+            filter_expr_parts.append(f"log_group_name == '{log_group_name}'")
 
         if log_stream_name:
-            filter_expr += f" AND log_stream_name == '{log_stream_name}'"
+            filter_expr_parts.append(f"log_stream_name == '{log_stream_name}'")
 
         if start_time:
-            filter_expr += f" AND timestamp >= {start_time * 1000}"
+            # logs are in microseconds, start_time is in milliseconds
+            ts_start = datetime.fromtimestamp(start_time / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            print(f"[Warehouse] Filter start: {ts_start}")
+            filter_expr_parts.append(f"timestamp >= {int(start_time * 1000)}")
         if end_time:
-            filter_expr += f" AND timestamp <= {end_time * 1000}"
+            ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            print(f"[Warehouse] Filter end: {ts_end}")
+            filter_expr_parts.append(f"timestamp <= {int(end_time * 1000)}")
+
+        if start_time:
+            # Get everything and filter in memory if Iceberg filter is being tricky
+            print(f"[Warehouse] Requesting all data due to filtering issues")
+            filter_expr = None 
+        else:
+            filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
 
         result = self.query(filter_expr=filter_expr, limit=limit)
 
         events = []
         for i in range(result.num_rows):
             ts = result.column("timestamp")[i].as_py()
-            events.append(
-                {
-                    "timestamp": int(ts.timestamp() * 1000) if ts else 0,
-                    "message": result.column("message")[i].as_py() or "",
-                    "ingestionTime": int(
-                        result.column("ingestion_time")[i].as_py().timestamp() * 1000
+            ts_ms = int(ts.timestamp() * 1000) if ts else 0
+            
+            # Manual in-memory timestamp filtering
+            if start_time and ts_ms < start_time:
+                continue
+            if end_time and ts_ms > end_time:
+                continue
+
+            event = {
+                "timestamp": ts_ms,
+                "message": result.column("message")[i].as_py() or "",
+                "ingestionTime": int(
+                    result.column("ingestion_time")[i].as_py().timestamp() * 1000
+                )
+                if result.column("ingestion_time")[i].as_py()
+                else 0,
+            }
+
+            try:
+                event["logGroupName"] = result.column("log_group_name")[i].as_py() or ""
+            except:
+                pass
+            try:
+                event["logStreamName"] = (
+                    result.column("log_stream_name")[i].as_py() or ""
+                )
+            except:
+                pass
+
+            label_columns = self._get_label_columns()
+            for label_col in label_columns:
+                try:
+                    event[f"label_{label_col}"] = (
+                        result.column(f"label_{label_col}")[i].as_py() or ""
                     )
-                    if result.column("ingestion_time")[i].as_py()
-                    else 0,
-                }
-            )
+                except:
+                    event[f"label_{label_col}"] = ""
+
+            events.append(event)
 
         events.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
         return events[:limit]
 
     def compact(self):
-        if not self.compaction_enabled:
-            return {"status": "skipped", "reason": "disabled"}
-
-        try:
-            import pyarrow.parquet as pq
-            import pyarrow
-            import tempfile
-            import shutil
-
-            table = self.get_table()
-            data_path = Path(table.location()) / "data"
-
-            if not data_path.exists():
-                return {"status": "skipped", "reason": "no data path"}
-
-            files = list(data_path.glob("**/*.parquet"))
-
-            if len(files) <= self.compaction_max_files:
-                return {
-                    "status": "skipped",
-                    "reason": f"only {len(files)} files, max is {self.compaction_max_files}",
-                }
-
-            print(f"[Compaction] Starting file compaction for {len(files)} files...")
-
-            partition_files = {}
-            for f in files:
-                parent = f.parent
-                if parent not in partition_files:
-                    partition_files[parent] = []
-                partition_files[parent].append(f)
-
-            total_rewritten = 0
-            for partition_path, parquet_files in partition_files.items():
-                if len(parquet_files) < 5:
-                    continue
-
-                tables = [pq.read_table(fp) for fp in parquet_files]
-                combined = pyarrow.concat_tables(tables)
-
-                partition_name = partition_path.name
-                output_name = f"merged_{int(time.time())}.parquet"
-                output_path = partition_path / output_name
-
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".parquet"
-                ) as tmp:
-                    tmp_path = tmp.name
-
-                pq.write_table(combined, tmp_path, compression="zstd")
-                shutil.move(tmp_path, output_path)
-
-                for fp in parquet_files:
-                    fp.unlink()
-
-                total_rewritten += 1
-                print(
-                    f"[Compaction] Compacted {len(parquet_files)} files into {output_name}"
-                )
-
-            return {
-                "status": "success",
-                "partitions_rewritten": total_rewritten,
-                "message": f"Compacted {total_rewritten} partitions using PyArrow merge",
-            }
-        except Exception as e:
-            print(f"[Compaction] Error: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return {"status": "error", "error": str(e)}
+        """
+        Compaction is currently disabled via direct file manipulation because it breaks Iceberg metadata.
+        Iceberg requires manifest updates when files are deleted or added.
+        """
+        return {"status": "skipped", "reason": "unsafe file-level compaction disabled"}
 
     def enforce_retention(self):
         if not self.retention_enabled:
