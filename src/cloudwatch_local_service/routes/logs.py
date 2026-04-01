@@ -1,18 +1,10 @@
-import os
 import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from flask import Blueprint, request, jsonify
 import time
 
 from cloudwatch_local_service.services.log_store import log_store
-from cloudwatch_local_service.services.file_storage import FileStorage
-
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "./logs"))
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-file_storage = FileStorage(LOGS_DIR)
 
 logs_bp = Blueprint("logs", __name__)
 
@@ -77,8 +69,6 @@ def put_log_events():
         log_group_name, log_stream_name, log_events, ingestion_time
     )
     next_token = str(new_sequence)
-
-    file_storage.save_logs(log_group_name, log_stream_name, log_events, ingestion_time)
 
     return jsonify(
         {

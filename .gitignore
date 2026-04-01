@@ -49,5 +49,4 @@ env/
 .DS_Store
 Thumbs.db
 
-# Project specific
-*.jsonl
+

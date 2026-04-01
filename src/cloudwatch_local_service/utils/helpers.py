@@ -1,17 +1,8 @@
 import re
-from pathlib import Path
 
 
 def get_log_group_key(log_group_name, log_stream_name):
     return f"{log_group_name}/{log_stream_name}"
-
-
-def get_log_file_path(log_group_name, log_stream_name, logs_dir):
-    safe_group_name = log_group_name.replace("/", "_")
-    safe_stream_name = log_stream_name.replace("/", "_")
-    group_dir = logs_dir / safe_group_name
-    group_dir.mkdir(parents=True, exist_ok=True)
-    return group_dir / f"{safe_stream_name}.jsonl"
 
 
 def parse_filter_pattern(filter_pattern, message):
