@@ -10,8 +10,9 @@ from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from datetime import datetime
+import logging
 
+logger = logging.getLogger("service.buffer")
 
 class LogBuffer:
     def __init__(
@@ -55,7 +56,7 @@ class LogBuffer:
 
     def _recover_wal(self):
         """Load pending logs from WAL files on startup."""
-        print(f"[LogBuffer] Recovering WAL from {self.wal_dir}...")
+        logger.info(f"Recovering WAL from {self.wal_dir}...")
         wal_files = sorted(list(self.wal_dir.glob("*.wal")))
         recovered_count = 0
         for wal_file in wal_files:
@@ -69,10 +70,10 @@ class LogBuffer:
                 # Or we can rename them to .recovered to avoid double recovery if crash during recovery
                 wal_file.rename(wal_file.with_suffix(".wal.pending"))
             except Exception as e:
-                print(f"[LogBuffer] Failed to recover WAL file {wal_file}: {e}")
+                logger.error(f"Failed to recover WAL file {wal_file}: {e}")
         
         if recovered_count > 0:
-            print(f"[LogBuffer] Recovered {recovered_count} logs from WAL.")
+            logger.info(f"Recovered {recovered_count} logs from WAL.")
 
     def set_warehouse(self, warehouse):
         self._warehouse = warehouse
@@ -89,13 +90,13 @@ class LogBuffer:
                 t = threading.Thread(target=self._worker_loop, name=f"LogWorker-{i}", daemon=True)
                 t.start()
                 self._worker_threads.append(t)
-            print(f"[LogBuffer] Started {self._num_workers} worker threads.")
+            logger.info(f"Started {self._num_workers} worker threads.")
 
     def stop(self):
         self._stop_event.set()
         
         # Wait for workers to finish current tasks
-        print(f"[LogBuffer] Stopping workers and flushing remaining logs...")
+        logger.info("Stopping workers and flushing remaining logs...")
         for t in self._worker_threads:
             t.join(timeout=5)
             
@@ -117,7 +118,7 @@ class LogBuffer:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"[LogBuffer] Worker error: {e}")
+                logger.error(f"Worker error: {e}")
                 self._last_error = f"Worker Error: {e}"
 
     def _perform_flush(self, logs_to_write: List[Dict[str, Any]]):
@@ -144,7 +145,7 @@ class LogBuffer:
                 return len(logs_to_write)
             except Exception as e:
                 self._last_error = str(e)
-                print(f"[LogBuffer] Flush failed, keeping logs in buffer: {e}")
+                logger.error(f"Flush failed, keeping logs in buffer: {e}")
                 with self._lock:
                     # Prepend failed logs back to buffer (need to restore metadata if possible)
                     # But for now, we just prepend them back
@@ -164,7 +165,7 @@ class LogBuffer:
                     f.write(json.dumps(log) + "\n")
             return wal_file
         except Exception as e:
-            print(f"[LogBuffer] WAL Write Error: {e}")
+            logger.error(f"WAL Write Error: {e}")
             return None
 
     def add(self, logs: List[Dict[str, Any]]):

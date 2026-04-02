@@ -14,6 +14,9 @@ from service.routes.store import store_bp
 from service.routes.ingest import ingest_bp
 from service.routes.loki import loki_bp
 from service.routes.metrics import metrics_bp
+from service.utils.logging_config import setup_logging
+
+logger = setup_logging()
 
 app = Flask(__name__)
 
@@ -28,7 +31,7 @@ try:
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 except Exception as e:
-    print(f"[Config] Failed to load: {e}")
+    logger.error(f"[Config] Failed to load from {config_path}: {e}")
     config = {}
 
 buffer_config = config.get("buffer", {})
@@ -57,15 +60,11 @@ try:
     log_buffer.start()
 
     stats = warehouse.get_stats()
-    print(
-        f"[Warehouse] Initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}"
-    )
-    print(f"[Warehouse] Stats: {stats}")
-    print(
-        f"[Buffer] max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s, workers={buffer_worker_threads}, wal_enabled={wal_enabled}"
-    )
+    logger.info(f"Warehouse initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}")
+    logger.debug(f"Warehouse stats: {stats}")
+    logger.info(f"Buffer config: max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s, workers={buffer_worker_threads}, wal_enabled={wal_enabled}")
 except Exception as e:
-    print(f"[Warehouse] Failed to initialize: {e}")
+    logger.error(f"Failed to initialize warehouse/buffer: {e}")
 
 app.register_blueprint(logs_bp)
 app.register_blueprint(groups_bp)
@@ -87,16 +86,13 @@ def health():
 
 @app.route("/", methods=["GET", "POST", "PUT"])
 def handle_request():
-    print(f"\n{'=' * 60}")
-    print(f"[Request] Method: {request.method}")
-    print(f"[Request] Headers: {dict(request.headers)}")
-    print(f"[Request] Args: {dict(request.args)}")
+    logger.debug(f"Request: {request.method} {request.path}")
     if request.method == "POST":
         try:
-            print(f"[Request] Body: {request.get_json(force=True)}")
+            body = request.get_json(force=True)
+            logger.debug(f"Request body: {body}")
         except:
-            print(f"[Request] Body: (could not parse)")
-    print(f"{'=' * 60}\n")
+            pass
 
     amz_target = request.headers.get("X-Amz-Target", "")
 

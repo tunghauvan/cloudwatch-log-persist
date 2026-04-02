@@ -13,6 +13,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from service.services.warehouse_metrics import warehouse_metrics
 
+import logging
+
+logger = logging.getLogger("service.warehouse")
+
 try:
     from pyiceberg.catalog import load_catalog
     from pyiceberg.schema import Schema
@@ -27,7 +31,7 @@ try:
 
     PYICEBERG_AVAILABLE = True
 except ImportError as e:
-    print(f"PyIceberg import error: {e}")
+    logger.debug(f"PyIceberg import error: {e}")
     PYICEBERG_AVAILABLE = False
 
 try:
@@ -36,7 +40,7 @@ try:
 
     PYSPARK_AVAILABLE = True
 except ImportError as e:
-    print(f"PySpark import error: {e}")
+    logger.debug(f"PySpark import error: {e}")
     PYSPARK_AVAILABLE = False
 
 
@@ -232,7 +236,7 @@ class WarehouseManager:
         try:
             # Check if table already exists in catalog
             self.catalog.load_table(table_id)
-            print(f"[Warehouse] Loaded existing CloudWatch logs table: {table_id}")
+            logger.info(f" Loaded existing CloudWatch logs table: {table_id}")
         except Exception:
             try:
                 self.catalog.create_table(
@@ -240,16 +244,16 @@ class WarehouseManager:
                     schema=self._get_schema(),
                     partition_spec=self._get_partition_spec(),
                 )
-                print(f"[Warehouse] Created new CloudWatch logs table: {table_id}")
+                logger.info(f" Created new CloudWatch logs table: {table_id}")
             except Exception as e:
-                print(f"[Warehouse] CloudWatch table exception: {type(e).__name__}: {e}")
+                logger.info(f" CloudWatch table exception: {type(e).__name__}: {e}")
 
         # Create Loki logs table if configured
         loki_table = self.config.get("loki", {}).get("table_name", "loki_logs")
         loki_table_id = f"{self.namespace}.{loki_table}"
         try:
             self.catalog.load_table(loki_table_id)
-            print(f"[Warehouse] Loaded existing Loki logs table: {loki_table_id}")
+            logger.info(f" Loaded existing Loki logs table: {loki_table_id}")
         except Exception:
             try:
                 self.catalog.create_table(
@@ -257,9 +261,9 @@ class WarehouseManager:
                     schema=self._get_schema(),
                     partition_spec=self._get_partition_spec(),
                 )
-                print(f"[Warehouse] Created new Loki logs table: {loki_table_id}")
+                logger.info(f" Created new Loki logs table: {loki_table_id}")
             except Exception as e:
-                print(f"[Warehouse] Loki table exception: {type(e).__name__}: {e}")
+                logger.info(f" Loki table exception: {type(e).__name__}: {e}")
 
     def _get_label_columns(self) -> List[str]:
         ingest_config = self.config.get("ingest", {})
@@ -306,7 +310,7 @@ class WarehouseManager:
                 or "does not exist" in err_str
             ):
                 print(
-                    f"[Warehouse] Table {table_id} not found, returning empty result"
+                    f"Table {table_id} not found, returning empty result"
                 )
                 warehouse_metrics.record_insert(
                     logs_count=logs_count,
@@ -388,7 +392,7 @@ class WarehouseManager:
             names.append(f"label_{label_col}")
 
         table = pa.table(arrays, names=names)
-        print(f"[Warehouse] Inserting {len(logs)} logs to table {target_table_name}")
+        logger.info(f" Inserting {len(logs)} logs to table {target_table_name}")
         table_obj.append(table)
 
         # Record successful insert
@@ -414,7 +418,7 @@ class WarehouseManager:
             table_obj = self.catalog.load_table(table_id)
         except Exception as e:
             if "not found" in str(e).lower() or "nosuch" in str(e).lower():
-                print(f"[Warehouse] Table {table_id} not found, returning empty result")
+                logger.info(f" Table {table_id} not found, returning empty result")
                 warehouse_metrics.record_query(
                     logs_returned=0,
                     duration_seconds=time.time() - start_time,
@@ -436,7 +440,7 @@ class WarehouseManager:
 
         try:
             print(
-                f"[Warehouse] Running query on {target_table_name} with filter: {filter_expr}"
+                f"Running query on {target_table_name} with filter: {filter_expr}"
             )
             scan = table_obj.scan()
             if filter_expr:
@@ -445,7 +449,7 @@ class WarehouseManager:
             result = scan.to_arrow()
             logs_returned = len(result)
             print(
-                f"[Warehouse] Query returned {logs_returned} rows from {target_table_name}"
+                f"Query returned {logs_returned} rows from {target_table_name}"
             )
 
             # Record successful query
@@ -455,7 +459,7 @@ class WarehouseManager:
             )
             return result
         except FileNotFoundError as e:
-            print(f"[Warehouse] Data file not found, rebuilding table: {e}")
+            logger.info(f" Data file not found, rebuilding table: {e}")
             warehouse_metrics.record_query(
                 logs_returned=0, duration_seconds=time.time() - start_time, error=True
             )
@@ -549,18 +553,18 @@ class WarehouseManager:
             ts_start = datetime.fromtimestamp(
                 start_time / 1000.0, tz=timezone.utc
             ).replace(tzinfo=None)
-            print(f"[Warehouse] Filter start: {ts_start}")
+            logger.info(f" Filter start: {ts_start}")
             filter_expr_parts.append(f"timestamp >= {int(start_time * 1000)}")
         if end_time:
             ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(
                 tzinfo=None
             )
-            print(f"[Warehouse] Filter end: {ts_end}")
+            logger.info(f" Filter end: {ts_end}")
             filter_expr_parts.append(f"timestamp <= {int(end_time * 1000)}")
 
         if start_time:
             # Get everything and filter in memory if Iceberg filter is being tricky
-            print(f"[Warehouse] Requesting all data due to filtering issues")
+            logger.info(f" Requesting all data due to filtering issues")
             filter_expr = None
         else:
             filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
@@ -748,12 +752,12 @@ class WarehouseManager:
             metadata_dir = table_path / "metadata"
 
             if not metadata_dir.exists():
-                print(f"[Warehouse] No metadata directory found at {metadata_dir}")
+                logger.info(f" No metadata directory found at {metadata_dir}")
                 return False
 
             metadata_files = sorted(metadata_dir.glob("*.metadata.json"))
             if not metadata_files:
-                print(f"[Warehouse] No metadata files found in {metadata_dir}")
+                logger.info(f" No metadata files found in {metadata_dir}")
                 return False
 
             latest_metadata = metadata_files[-1]
@@ -778,20 +782,20 @@ class WarehouseManager:
                 current_location = row[0]
                 if current_location != new_location:
                     print(
-                        f"[Warehouse] Catalog mismatch: catalog={current_location}, latest={latest_metadata.name}"
+                        f"Catalog mismatch: catalog={current_location}, latest={latest_metadata.name}"
                     )
                     cursor.execute(
                         "UPDATE iceberg_tables SET metadata_location = %s WHERE table_namespace = %s AND table_name = %s",
                         (new_location, self.namespace, self.table_name),
                     )
                     conn.commit()
-                    print(f"[Warehouse] Updated catalog to {latest_metadata.name}")
+                    logger.info(f" Updated catalog to {latest_metadata.name}")
 
             cursor.close()
             conn.close()
             return True
         except Exception as e:
-            print(f"[Warehouse] Catalog check/repair failed: {e}")
+            logger.info(f" Catalog check/repair failed: {e}")
             return False
 
     def _repair_missing_data_files(self):
@@ -805,15 +809,15 @@ class WarehouseManager:
                     existing_files.add(f.name)
 
             if not existing_files:
-                print(f"[Warehouse] No data files exist, will reset table")
+                logger.info(f" No data files exist, will reset table")
                 self._reset_table_for_missing_data()
                 return
 
-            print(f"[Warehouse] Found {len(existing_files)} data files on disk")
+            logger.info(f" Found {len(existing_files)} data files on disk")
             self._table = None
 
         except Exception as e:
-            print(f"[Warehouse] Error repairing missing data files: {e}")
+            logger.info(f" Error repairing missing data files: {e}")
             self._table = None
 
     def _reset_table_for_missing_data(self):
@@ -844,13 +848,13 @@ class WarehouseManager:
                 shutil.rmtree(table_path)
 
             print(
-                f"[Warehouse] Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
+                f"Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
             )
             self._table = None
             self._catalog = None
 
         except Exception as e:
-            print(f"[Warehouse] Error resetting table: {e}")
+            logger.info(f" Error resetting table: {e}")
             self._table = None
 
 
@@ -861,7 +865,7 @@ class WarehouseManager:
             )
             self._compaction_thread.start()
             print(
-                f"[Warehouse] Started compaction thread (interval: {self.compaction_interval}s)"
+                f"Started compaction thread (interval: {self.compaction_interval}s)"
             )
 
         if self.retention_enabled and not self._retention_thread:
@@ -869,7 +873,7 @@ class WarehouseManager:
                 target=self._retention_loop, daemon=True
             )
             self._retention_thread.start()
-            print(f"[Warehouse] Started retention enforcement thread")
+            logger.info(f" Started retention enforcement thread")
 
     def stop_maintenance(self):
         self._stop_event.set()
@@ -877,4 +881,4 @@ class WarehouseManager:
             self._compaction_thread.join(timeout=5)
         if self._retention_thread:
             self._retention_thread.join(timeout=5)
-        print("[Warehouse] Stopped maintenance threads")
+        logger.info(" Stopped maintenance threads")

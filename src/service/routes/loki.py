@@ -7,6 +7,9 @@ import re
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from service.services.loki_metrics import loki_metrics
+import logging
+
+logger = logging.getLogger("service.loki")
 
 loki_bp = Blueprint("loki", __name__)
 
@@ -567,25 +570,25 @@ def loki_query_range():
             end_time=end,
             limit=None,  # No limit, fetch all logs in the time range
         )
-        print(f"[Debug] Warehouse returned {len(events)} events before filtering")
+        logger.debug(f" Warehouse returned {len(events)} events before filtering")
     except Exception as e:
-        print(f"[Debug] Warehouse error: {e}")
+        logger.debug(f" Warehouse error: {e}")
         events = []
 
     filtered_events = []
-    print(f"[Debug] Filtering starts for {len(events)} events. Request Limit: {limit}")
+    logger.debug(f" Filtering starts for {len(events)} events. Request Limit: {limit}")
     filtered_events = []
     # Log the first event keys and all labels found
     if events:
         first_e = events[0]
-        print(f"[Debug] First event object keys: {list(first_e.keys())}")
+        logger.debug(f" First event object keys: {list(first_e.keys())}")
         label_keys = [k for k in first_e.keys() if k.startswith("label_")]
         if label_keys:
             print(
                 f"[Debug] Label keys found in first event: {label_keys}, Example values: {[(k, first_e[k]) for k in label_keys]}"
             )
         else:
-            print(f"[Debug] NO label_ keys found in first event!")
+            logger.debug(f" NO label_ keys found in first event!")
 
     for e in events:
         match = True
@@ -603,7 +606,7 @@ def loki_query_range():
         if match:
             filtered_events.append(e)
 
-    print(f"[Debug] Filtering done. {len(filtered_events)} events matched.")
+    logger.debug(f" Filtering done. {len(filtered_events)} events matched.")
     
     # Only apply the limit for regular log queries to keep Grafana happy.
     # For metric queries, we want to use all matched events.
@@ -898,7 +901,7 @@ def loki_series():
 
             streams = list(unique_streams.values())
         except Exception as e:
-            print(f"[Series] Error: {e}")
+            logger.error(f" Error: {e}")
 
     # Return default if no streams
     if not streams:
@@ -1006,7 +1009,7 @@ def loki_index_stats():
             )
             chunks = max(1, entries // 1000)  # Approximate chunks
         except Exception as e:
-            print(f"[Index Stats] Error: {e}")
+            logger.error(f" Error: {e}")
 
     # Return flat JSON (not wrapped)
     loki_metrics.record_index_stats_request()
@@ -1137,7 +1140,7 @@ def loki_index_volume():
                     {"metric": metric, "value": [timestamp, str(vol["bytes"])]}
                 )
         except Exception as e:
-            print(f"[Volume] Error querying: {e}")
+            logger.error(f" Error querying: {e}")
 
     # If no results, add a default one with proper metric
     if not result:
@@ -1439,7 +1442,7 @@ def loki_index_volume_range():
 
                 result.append({"metric": metric, "values": values})
         except Exception as e:
-            print(f"[Volume Range] Error: {e}")
+            logger.error(f" Error: {e}")
 
     loki_metrics.record_index_volume_range_request()
     return jsonify(
@@ -1633,7 +1636,7 @@ def loki_detected_field_values(name):
 
             values = list(unique_values)[:limit]
         except Exception as e:
-            print(f"[Detected Field Values] Error: {e}")
+            logger.error(f" Error: {e}")
 
     # Return default values if no data
     if not values:
