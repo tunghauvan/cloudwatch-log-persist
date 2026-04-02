@@ -4,6 +4,10 @@ from flask import Blueprint, request, jsonify
 import time
 import re
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from cloudwatch_local_service.services.loki_metrics import loki_metrics
+
 loki_bp = Blueprint("loki", __name__)
 
 
@@ -162,10 +166,13 @@ def loki_push():
         streams = data.get("streams", [])
 
     if not streams:
+        loki_metrics.record_push(logs_count=0, streams_count=0)
         return jsonify({"status": "ok"}), 200
 
     ingestion_time = int(time.time() * 1000)
     warehouse_logs = []
+    total_logs = 0
+    stream_count = len(streams)
 
     for stream in streams:
         labels_str = stream.get("stream", {})
@@ -184,39 +191,46 @@ def loki_push():
             timestamp_ns, message = entry
             # Convert nanoseconds (Loki) to microseconds (Warehouse)
             timestamp_us = int(int(timestamp_ns) / 1000)
+            total_logs += 1
 
             log_entry = {
                 "logGroupName": log_group,
                 "logStreamName": log_stream,
                 "timestamp": timestamp_us,
                 "message": message,
-                "ingestionTime": timestamp_us, # Use log timestamp for ingestion_time
+                "ingestionTime": timestamp_us,  # Use log timestamp for ingestion_time
                 "sequenceToken": 0,
             }
-            
+
             # Map ALL stream labels to label_ prefix for storage
             for k, v in labels_str.items():
                 safe_key = k.replace("-", "_").replace(" ", "_")
                 log_entry[f"label_{safe_key}"] = v
-            
+
             # Auto mapping alias: pod -> logStreamName, namespace -> logGroupName if needed
             if "pod" in labels_str and log_stream == "default":
                 log_entry["logStreamName"] = labels_str["pod"]
             if "namespace" in labels_str and log_group == "default":
                 log_entry["logGroupName"] = labels_str["namespace"]
-            
+
             # Application alias: if app is missing but service is present, use service
             if not labels_str.get("app") and labels_str.get("service"):
                 log_entry["label_app"] = labels_str["service"]
             elif not labels_str.get("service") and labels_str.get("app"):
                 log_entry["label_service"] = labels_str["app"]
-                
+
             warehouse_logs.append(log_entry)
 
     try:
         log_buffer.add(warehouse_logs)
+        loki_metrics.record_push(
+            logs_count=total_logs, streams_count=stream_count, error=False
+        )
         return jsonify({"status": "ok"}), 200
     except Exception as e:
+        loki_metrics.record_push(
+            logs_count=total_logs, streams_count=stream_count, error=True
+        )
         return jsonify({"error": str(e)}), 500
 
 
@@ -254,6 +268,7 @@ def loki_query():
     if is_metric_query(query):
         # Return vector result for metric queries
         timestamp = int(time_param) if time_param else int(time.time())
+        loki_metrics.record_query(logs_returned=1, error=False)
         return jsonify(
             {
                 "status": "success",
@@ -432,6 +447,7 @@ def loki_query():
             limit=limit * 10,
         )
     except Exception as e:
+        loki_metrics.record_query(logs_returned=0, error=True)
         events = []
 
     filtered_events = []
@@ -471,6 +487,7 @@ def loki_query():
 
     streams = logs_to_loki_streams(logs)
 
+    loki_metrics.record_query(logs_returned=len(logs), error=False)
     return jsonify(
         {
             "status": "success",
@@ -494,7 +511,9 @@ def loki_query():
 
 @loki_bp.route("/loki/api/v1/query_range", methods=["GET", "POST"])
 def loki_query_range():
-    print(f"[Debug] Loki Query Range received. Params: {request.args if request.method == 'GET' else 'POST body'}")
+    print(
+        f"[Debug] Loki Query Range received. Params: {request.args if request.method == 'GET' else 'POST body'}"
+    )
     warehouse = get_warehouse()
     if not warehouse:
         return jsonify({"error": "service not available"}), 503
@@ -529,7 +548,9 @@ def loki_query_range():
     log_group, log_stream, message_filter, labels_filter, regex_label = (
         parse_logql_filter(query)
     )
-    print(f"[Debug] Parsed filter: group={log_group}, stream={log_stream}, labels={labels_filter}")
+    print(
+        f"[Debug] Parsed filter: group={log_group}, stream={log_stream}, labels={labels_filter}"
+    )
 
     try:
         # Increase the FETCH limit from warehouse before filtering
@@ -553,9 +574,11 @@ def loki_query_range():
     if events:
         first_e = events[0]
         print(f"[Debug] First event object keys: {list(first_e.keys())}")
-        label_keys = [k for k in first_e.keys() if k.startswith('label_')]
+        label_keys = [k for k in first_e.keys() if k.startswith("label_")]
         if label_keys:
-            print(f"[Debug] Label keys found in first event: {label_keys}, Example values: {[(k, first_e[k]) for k in label_keys]}")
+            print(
+                f"[Debug] Label keys found in first event: {label_keys}, Example values: {[(k, first_e[k]) for k in label_keys]}"
+            )
         else:
             print(f"[Debug] NO label_ keys found in first event!")
 
@@ -586,14 +609,14 @@ def loki_query_range():
             if request.method == "GET"
             else (request.json or {}).get("step", "")
         )
-        
+
         # Get maxDataPoints for auto step calculation
         max_data_points = int(
             request.args.get("maxDataPoints", 500)
             if request.method == "GET"
             else (request.json or {}).get("maxDataPoints", 500)
         )
-        
+
         # Auto-calculate step if not provided
         if not step_str or step_str == "":
             # Calculate step based on time range and max data points
@@ -601,7 +624,9 @@ def loki_query_range():
             range_seconds = (end - start) / 1000.0
             auto_step = max(1, int(range_seconds / max(max_data_points, 1)))
             step_seconds = auto_step
-            print(f"[Debug] Auto-calculated step: {step_seconds}s from range {range_seconds}s and maxDataPoints {max_data_points}")
+            print(
+                f"[Debug] Auto-calculated step: {step_seconds}s from range {range_seconds}s and maxDataPoints {max_data_points}"
+            )
         else:
             try:
                 if isinstance(step_str, str):
@@ -619,7 +644,9 @@ def loki_query_range():
                 # Fallback to auto-calculate
                 range_seconds = (end - start) / 1000.0
                 step_seconds = max(1, int(range_seconds / max(max_data_points, 1)))
-                print(f"[Debug] Step parse failed, using auto-calculated: {step_seconds}s")
+                print(
+                    f"[Debug] Step parse failed, using auto-calculated: {step_seconds}s"
+                )
 
         # Extract aggregation label (e.g., "by (detected_level)")
         agg_label = None
@@ -734,6 +761,7 @@ def loki_query_range():
 
     streams = logs_to_loki_streams(logs)
 
+    loki_metrics.record_query_range(logs_returned=len(logs), error=False)
     return jsonify(
         {
             "status": "success",
@@ -758,6 +786,7 @@ def loki_query_range():
 @loki_bp.route("/loki/api/v1/label", methods=["GET"])
 @loki_bp.route("/loki/api/v1/labels", methods=["GET"])
 def loki_labels():
+    loki_metrics.record_label_request()
     return jsonify(
         {
             "status": "success",
@@ -768,6 +797,7 @@ def loki_labels():
 
 @loki_bp.route("/loki/api/v1/label/<label_name>/values", methods=["GET"])
 def loki_label_values(label_name):
+    loki_metrics.record_label_values_request()
     # Return some sample values for each label
     values_map = {
         "log_group": ["/myapp", "/system"],
@@ -878,6 +908,7 @@ def loki_series():
             },
         ]
 
+    loki_metrics.record_series_request(error=False)
     return jsonify({"status": "success", "data": streams})
 
 
@@ -969,6 +1000,7 @@ def loki_index_stats():
             print(f"[Index Stats] Error: {e}")
 
     # Return flat JSON (not wrapped)
+    loki_metrics.record_index_stats_request()
     return jsonify(
         {
             "streams": streams,
@@ -1264,6 +1296,7 @@ def loki_index_volume():
             },
         }
     )
+    loki_metrics.record_index_volume_request()
 
 
 @loki_bp.route("/loki/api/v1/index/volume_range", methods=["GET"])
@@ -1398,6 +1431,7 @@ def loki_index_volume_range():
         except Exception as e:
             print(f"[Volume Range] Error: {e}")
 
+    loki_metrics.record_index_volume_range_request()
     return jsonify(
         {
             "status": "success",

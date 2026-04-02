@@ -13,12 +13,14 @@ from cloudwatch_local_service.routes.query import query_bp
 from cloudwatch_local_service.routes.store import store_bp
 from cloudwatch_local_service.routes.ingest import ingest_bp
 from cloudwatch_local_service.routes.loki import loki_bp
+from cloudwatch_local_service.routes.metrics import metrics_bp
 
 app = Flask(__name__)
 
 config_path = Path(os.getenv("CONFIG_PATH", "/app/config.yaml"))
 warehouse = None
 log_buffer = None
+startup_time = time.time()
 
 try:
     import yaml
@@ -65,6 +67,7 @@ app.register_blueprint(query_bp)
 app.register_blueprint(store_bp)
 app.register_blueprint(ingest_bp)
 app.register_blueprint(loki_bp)
+app.register_blueprint(metrics_bp)
 
 
 @app.route("/", methods=["GET"])

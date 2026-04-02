@@ -7,6 +7,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+# Import metrics
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from cloudwatch_local_service.services.warehouse_metrics import warehouse_metrics
+
 try:
     from pyiceberg.catalog import load_catalog
     from pyiceberg.schema import Schema
@@ -359,7 +365,15 @@ class WarehouseManager:
         return [t.name for t in self.catalog.list_tables(self.namespace)]
 
     def insert_logs(self, logs: List[Dict[str, Any]]):
+        start_time = time.time()
+        logs_count = len(logs)
+
         if not PYICEBERG_AVAILABLE:
+            warehouse_metrics.record_insert(
+                logs_count=logs_count,
+                duration_seconds=time.time() - start_time,
+                error=True,
+            )
             raise RuntimeError("PyIceberg is not installed")
 
         if self._table is None:
@@ -376,6 +390,11 @@ class WarehouseManager:
                     print(
                         f"[Warehouse] Table {table_id} not found, returning empty result"
                     )
+                    warehouse_metrics.record_insert(
+                        logs_count=logs_count,
+                        duration_seconds=time.time() - start_time,
+                        error=False,
+                    )
                     import pyarrow as pa
 
                     return pa.table(
@@ -388,6 +407,11 @@ class WarehouseManager:
                             "sequence_token": [],
                         }
                     )
+                warehouse_metrics.record_insert(
+                    logs_count=logs_count,
+                    duration_seconds=time.time() - start_time,
+                    error=True,
+                )
                 raise
 
         import pyarrow as pa
@@ -411,7 +435,7 @@ class WarehouseManager:
                     ts_seconds = float(ts)
                 else:
                     ts_seconds = float(ts)
-                
+
                 return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).replace(
                     tzinfo=None
                 )
@@ -449,41 +473,90 @@ class WarehouseManager:
         print(f"[Warehouse] Inserting {len(logs)} logs to table {self.table_name}")
         self._table.append(table)
 
+        # Record successful insert
+        duration = time.time() - start_time
+        warehouse_metrics.record_insert(
+            logs_count=logs_count, duration_seconds=duration, error=False
+        )
+
     def query(self, filter_expr: Optional[str] = None, limit: int = 100):
+        start_time = time.time()
+
         if not PYICEBERG_AVAILABLE:
+            warehouse_metrics.record_query(
+                logs_returned=0, duration_seconds=time.time() - start_time, error=True
+            )
             raise RuntimeError("PyIceberg is not installed")
 
         # Always reload table to get fresh data files
         table_id = f"{self.namespace}.{self.table_name}"
-            
+
         try:
             self._table = self.catalog.load_table(table_id)
         except Exception as e:
             if "not found" in str(e).lower() or "nosuch" in str(e).lower():
                 print(f"[Warehouse] Table {table_id} not found, returning empty result")
+                warehouse_metrics.record_query(
+                    logs_returned=0,
+                    duration_seconds=time.time() - start_time,
+                    error=False,
+                )
                 import pyarrow as pa
-                return pa.table({
-                    "log_group_name": [], "log_stream_name": [], "timestamp": [],
-                    "message": [], "ingestion_time": [], "sequence_token": [],
-                })
+
+                return pa.table(
+                    {
+                        "log_group_name": [],
+                        "log_stream_name": [],
+                        "timestamp": [],
+                        "message": [],
+                        "ingestion_time": [],
+                        "sequence_token": [],
+                    }
+                )
             raise
 
         try:
-            print(f"[Warehouse] Running query on {self.table_name} with filter: {filter_expr}")
+            print(
+                f"[Warehouse] Running query on {self.table_name} with filter: {filter_expr}"
+            )
             scan = self._table.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
 
             result = scan.to_arrow()
-            print(f"[Warehouse] Query returned {len(result)} rows from {self.table_name}")
+            logs_returned = len(result)
+            print(
+                f"[Warehouse] Query returned {logs_returned} rows from {self.table_name}"
+            )
+
+            # Record successful query
+            duration = time.time() - start_time
+            warehouse_metrics.record_query(
+                logs_returned=logs_returned, duration_seconds=duration, error=False
+            )
         except FileNotFoundError as e:
             print(f"[Warehouse] Data file not found, rebuilding table: {e}")
+            warehouse_metrics.record_query(
+                logs_returned=0, duration_seconds=time.time() - start_time, error=True
+            )
             self._repair_missing_data_files()
             import pyarrow as pa
-            return pa.table({
-                "log_group_name": [], "log_stream_name": [], "timestamp": [],
-                "message": [], "ingestion_time": [], "sequence_token": [],
-            })
+
+            return pa.table(
+                {
+                    "log_group_name": [],
+                    "log_stream_name": [],
+                    "timestamp": [],
+                    "message": [],
+                    "ingestion_time": [],
+                    "sequence_token": [],
+                }
+            )
+        except Exception as e:
+            warehouse_metrics.record_query(
+                logs_returned=0, duration_seconds=time.time() - start_time, error=True
+            )
+            raise
 
         if limit and len(result) > limit:
             result = result.slice(0, limit)
@@ -552,18 +625,22 @@ class WarehouseManager:
 
         if start_time:
             # logs are in microseconds, start_time is in milliseconds
-            ts_start = datetime.fromtimestamp(start_time / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            ts_start = datetime.fromtimestamp(
+                start_time / 1000.0, tz=timezone.utc
+            ).replace(tzinfo=None)
             print(f"[Warehouse] Filter start: {ts_start}")
             filter_expr_parts.append(f"timestamp >= {int(start_time * 1000)}")
         if end_time:
-            ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(
+                tzinfo=None
+            )
             print(f"[Warehouse] Filter end: {ts_end}")
             filter_expr_parts.append(f"timestamp <= {int(end_time * 1000)}")
 
         if start_time:
             # Get everything and filter in memory if Iceberg filter is being tricky
             print(f"[Warehouse] Requesting all data due to filtering issues")
-            filter_expr = None 
+            filter_expr = None
         else:
             filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
 
@@ -573,7 +650,7 @@ class WarehouseManager:
         for i in range(result.num_rows):
             ts = result.column("timestamp")[i].as_py()
             ts_ms = int(ts.timestamp() * 1000) if ts else 0
-            
+
             # Manual in-memory timestamp filtering
             if start_time and ts_ms < start_time:
                 continue
@@ -620,6 +697,7 @@ class WarehouseManager:
         Compaction is currently disabled via direct file manipulation because it breaks Iceberg metadata.
         Iceberg requires manifest updates when files are deleted or added.
         """
+        warehouse_metrics.record_compaction()
         return {"status": "skipped", "reason": "unsafe file-level compaction disabled"}
 
     def enforce_retention(self):
@@ -659,6 +737,7 @@ class WarehouseManager:
                     except ValueError:
                         pass
 
+            warehouse_metrics.record_retention(removed_partitions=removed)
             return {"status": "success", "removed_partitions": removed}
         except Exception as e:
             print(f"[Retention] Error: {e}")
@@ -690,6 +769,26 @@ class WarehouseManager:
                         file_count = len(list(partition_dir.glob("*.parquet")))
                         partitions[partition_dir.name] = file_count
 
+            # Get log groups and streams count for metrics
+            try:
+                log_groups = self.get_log_groups()
+                log_groups_count = len(log_groups)
+                # Count streams across all groups
+                log_streams_count = 0
+                for group_name in log_groups:
+                    try:
+                        streams = self.get_log_streams(group_name)
+                        log_streams_count += len(streams)
+                    except:
+                        pass
+                # Update metrics cache
+                warehouse_metrics.update_stats_cache(
+                    log_groups=log_groups_count, log_streams=log_streams_count
+                )
+            except:
+                log_groups_count = 0
+                log_streams_count = 0
+
             return {
                 "table": f"{self.namespace}.{self.table_name}",
                 "location": table.location(),
@@ -702,6 +801,8 @@ class WarehouseManager:
                 "retention_enabled": self.retention_enabled,
                 "retention_days": self.retention_days,
                 "spark_available": PYSPARK_AVAILABLE,
+                "log_groups_count": log_groups_count,
+                "log_streams_count": log_streams_count,
             }
         except Exception as e:
             return {"error": str(e)}
