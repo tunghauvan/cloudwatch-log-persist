@@ -12,7 +12,7 @@ store_bp = Blueprint("store", __name__)
 @store_bp.route("/warehouse/stats", methods=["GET"])
 def get_warehouse_stats():
     try:
-        from cloudwatch_local_service.server import warehouse
+        from service.server import warehouse
 
         if not warehouse:
             return jsonify({"error": "Warehouse not initialized"}), 500
@@ -25,7 +25,7 @@ def get_warehouse_stats():
 @store_bp.route("/warehouse/compact", methods=["POST"])
 def trigger_compaction():
     try:
-        from cloudwatch_local_service.server import warehouse
+        from service.server import warehouse
 
         if not warehouse:
             return jsonify({"error": "Warehouse not initialized"}), 500
@@ -38,7 +38,7 @@ def trigger_compaction():
 @store_bp.route("/warehouse/retention", methods=["POST"])
 def trigger_retention():
     try:
-        from cloudwatch_local_service.server import warehouse
+        from service.server import warehouse
 
         if not warehouse:
             return jsonify({"error": "Warehouse not initialized"}), 500

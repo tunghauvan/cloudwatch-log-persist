@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from cloudwatch_local_service.services.warehouse_metrics import warehouse_metrics
+from service.services.warehouse_metrics import warehouse_metrics
 
 try:
     from pyiceberg.catalog import load_catalog

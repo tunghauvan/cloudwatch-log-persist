@@ -9,13 +9,13 @@ ingest_bp = Blueprint("ingest", __name__)
 
 
 def get_warehouse():
-    from cloudwatch_local_service.server import warehouse
+    from service.server import warehouse
 
     return warehouse
 
 
 def get_log_buffer():
-    from cloudwatch_local_service.server import log_buffer
+    from service.server import log_buffer
 
     return log_buffer
 
@@ -31,7 +31,7 @@ def parse_labels_from_headers():
 
 
 def parse_labels_from_config():
-    from cloudwatch_local_service.server import config
+    from service.server import config
 
     ingest_config = config.get("ingest", {})
     labels_config = ingest_config.get("labels", {})

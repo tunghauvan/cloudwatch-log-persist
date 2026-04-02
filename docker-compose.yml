@@ -16,12 +16,12 @@ services:
       timeout: 5s
       retries: 5
 
-  cloudwatch-local-service:
+  logs-service:
     build: .
-    container_name: cloudwatch-local-service
+    container_name: logs-service
     working_dir: /app
     volumes:
-      - ./src/cloudwatch_local_service:/app/cloudwatch_local_service
+      - ./src/service:/app/service
       - ./src:/app/src
       - ./data-warehouse:/warehouse
       - ./config.yaml:/app/config.yaml
@@ -33,7 +33,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python", "-m", "flask", "--app", "cloudwatch_local_service.server", "run", "--host", "0.0.0.0", "--port", "4588"]
+    command: ["python", "-m", "flask", "--app", "service.server", "run", "--host", "0.0.0.0", "--port", "4588"]
 
   grafana:
     image: grafana/grafana:latest
@@ -50,7 +50,7 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning
       - ./grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
-      - cloudwatch-local-service
+      - logs-service
 
   fluentbit:
     image: python:3.11-slim
@@ -59,7 +59,7 @@ services:
       - ./fluentbit/log-simulator.py:/app/log-simulator.py
     working_dir: /app
     depends_on:
-      - cloudwatch-local-service
+      - logs-service
     command: ["sh", "-c", "pip install requests && python log-simulator.py"]
     restart: unless-stopped
 

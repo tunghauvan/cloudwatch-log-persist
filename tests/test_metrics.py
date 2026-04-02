@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 def test_format_prometheus_metric():
     """Test Prometheus metric formatting"""
-    from cloudwatch_local_service.routes.metrics import format_prometheus_metric
+    from service.routes.metrics import format_prometheus_metric
 
     result = format_prometheus_metric("test_metric", 42, "Test description", "gauge")
 
@@ -26,7 +26,7 @@ def test_format_prometheus_metric():
 
 def test_format_without_help():
     """Test metric formatting without help text"""
-    from cloudwatch_local_service.routes.metrics import format_prometheus_metric
+    from service.routes.metrics import format_prometheus_metric
 
     result = format_prometheus_metric("simple_metric", 100)
 
@@ -39,7 +39,7 @@ def test_format_without_help():
 
 def test_counter_metric():
     """Test counter type metric"""
-    from cloudwatch_local_service.routes.metrics import format_prometheus_metric
+    from service.routes.metrics import format_prometheus_metric
 
     result = format_prometheus_metric(
         "requests_total", 999, "Total requests", "counter"

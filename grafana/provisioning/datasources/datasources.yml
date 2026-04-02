@@ -4,7 +4,7 @@ datasources:
   - name: Loki
     type: loki
     access: proxy
-    url: http://cloudwatch-local-service:4588
+    url: http://logs-service:4588
     isDefault: true
     editable: true
 
@@ -14,7 +14,7 @@ datasources:
     jsonData:
       authType: keys
       defaultRegion: us-east-1
-      endpoint: http://cloudwatch-local-service:4588
+      endpoint: http://logs-service:4588
     secureJsonData:
       accessKey: dummy
       secretKey: dummy

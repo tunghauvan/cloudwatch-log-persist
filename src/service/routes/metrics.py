@@ -9,31 +9,31 @@ metrics_bp = Blueprint("metrics", __name__)
 
 
 def get_warehouse():
-    from cloudwatch_local_service.server import warehouse
+    from service.server import warehouse
 
     return warehouse
 
 
 def get_log_buffer():
-    from cloudwatch_local_service.server import log_buffer
+    from service.server import log_buffer
 
     return log_buffer
 
 
 def get_startup_time():
-    from cloudwatch_local_service.server import startup_time
+    from service.server import startup_time
 
     return startup_time
 
 
 def get_loki_metrics():
-    from cloudwatch_local_service.services.loki_metrics import loki_metrics
+    from service.services.loki_metrics import loki_metrics
 
     return loki_metrics
 
 
 def get_warehouse_metrics():
-    from cloudwatch_local_service.services.warehouse_metrics import warehouse_metrics
+    from service.services.warehouse_metrics import warehouse_metrics
 
     return warehouse_metrics
 

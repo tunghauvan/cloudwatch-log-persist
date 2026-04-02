@@ -4,7 +4,7 @@ from pathlib import Path
 from flask import Blueprint, request, jsonify
 import time
 
-from cloudwatch_local_service.services.log_store import log_store
+from service.services.log_store import log_store
 
 logs_bp = Blueprint("logs", __name__)
 

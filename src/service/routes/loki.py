@@ -6,19 +6,19 @@ import re
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cloudwatch_local_service.services.loki_metrics import loki_metrics
+from service.services.loki_metrics import loki_metrics
 
 loki_bp = Blueprint("loki", __name__)
 
 
 def get_warehouse():
-    from cloudwatch_local_service.server import warehouse
+    from service.server import warehouse
 
     return warehouse
 
 
 def get_log_buffer():
-    from cloudwatch_local_service.server import log_buffer
+    from service.server import log_buffer
 
     return log_buffer
 

@@ -8,7 +8,7 @@ import threading
 import time
 from unittest.mock import Mock, patch
 
-from src.cloudwatch_local_service.services.log_buffer import LogBuffer
+from src.service.services.log_buffer import LogBuffer
 
 
 class TestLogBuffer(unittest.TestCase):

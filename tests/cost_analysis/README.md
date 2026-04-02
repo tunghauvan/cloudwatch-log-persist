@@ -153,7 +153,7 @@ parquet_file_count:
 
 - **Integration Tests**: `tests/integration_api_test.py` (10 tests passing)
 - **Full Report**: `docs/COST_ANALYSIS_REPORT.md`
-- **CloudWatch Local Service**: `src/cloudwatch_local_service/`
+- **CloudWatch Local Service**: `src/service/`
 - **Warehouse**: `src/warehouse/warehouse.py`
 
 ---

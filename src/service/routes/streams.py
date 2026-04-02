@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from flask import Blueprint, request, jsonify
 
-from cloudwatch_local_service.services.log_store import log_store
+from service.services.log_store import log_store
 
 streams_bp = Blueprint("streams", __name__)
 

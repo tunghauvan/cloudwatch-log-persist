@@ -8,7 +8,7 @@ import requests
 from datetime import datetime, timezone
 
 # Loki endpoint
-LOKI_URL = "http://cloudwatch-local-service:4588/loki/api/v1/push"
+LOKI_URL = "http://logs-service:4588/loki/api/v1/push"
 
 # Sample log messages
 LOG_MESSAGES = [

@@ -6,8 +6,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from flask import Blueprint, request, jsonify
 import time
 import re
-from cloudwatch_local_service.services.log_store import log_store
-from cloudwatch_local_service.routes.query_parser import parse_query
+from service.services.log_store import log_store
+from service.routes.query_parser import parse_query
 
 query_bp = Blueprint("query", __name__)
 
@@ -36,7 +36,7 @@ query_executions = {}
 
 
 def _get_warehouse():
-    from cloudwatch_local_service.server import warehouse
+    from service.server import warehouse
 
     return warehouse
 

@@ -7,15 +7,15 @@ import unittest
 from unittest.mock import Mock, patch, MagicMock
 import time
 
-from src.cloudwatch_local_service.routes.query_parser import parse_query
-from src.cloudwatch_local_service.routes.query import (
+from src.service.routes.query_parser import parse_query
+from src.service.routes.query import (
     _apply_filter,
     QueryExecution,
     execute_query_internal,
     get_query_results_internal,
     query_executions,
 )
-from src.cloudwatch_local_service.routes.query import _get_warehouse
+from src.service.routes.query import _get_warehouse
 
 
 class TestQueryParser(unittest.TestCase):
@@ -328,7 +328,7 @@ class TestExecuteQueryInternal(unittest.TestCase):
     def setUp(self):
         query_executions.clear()
 
-    @patch("cloudwatch_local_service.routes.query._get_warehouse")
+    @patch("service.routes.query._get_warehouse")
     def test_execute_query_without_warehouse(self, mock_get_warehouse):
         mock_get_warehouse.return_value = None
 
@@ -343,7 +343,7 @@ class TestExecuteQueryInternal(unittest.TestCase):
         query_id = result["queryId"]
         self.assertIn(query_id, query_executions)
 
-    @patch("cloudwatch_local_service.routes.query._get_warehouse")
+    @patch("service.routes.query._get_warehouse")
     def test_execute_query_creates_execution(self, mock_get_warehouse):
         mock_get_warehouse.return_value = None
 

@@ -6,14 +6,14 @@ from flask import Flask, request, jsonify
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cloudwatch_local_service.routes.logs import logs_bp
-from cloudwatch_local_service.routes.groups import groups_bp
-from cloudwatch_local_service.routes.streams import streams_bp
-from cloudwatch_local_service.routes.query import query_bp
-from cloudwatch_local_service.routes.store import store_bp
-from cloudwatch_local_service.routes.ingest import ingest_bp
-from cloudwatch_local_service.routes.loki import loki_bp
-from cloudwatch_local_service.routes.metrics import metrics_bp
+from service.routes.logs import logs_bp
+from service.routes.groups import groups_bp
+from service.routes.streams import streams_bp
+from service.routes.query import query_bp
+from service.routes.store import store_bp
+from service.routes.ingest import ingest_bp
+from service.routes.loki import loki_bp
+from service.routes.metrics import metrics_bp
 
 app = Flask(__name__)
 
@@ -37,7 +37,7 @@ buffer_flush_interval = buffer_config.get("flush_interval_seconds", 10)
 
 try:
     from warehouse.warehouse import WarehouseManager
-    from cloudwatch_local_service.services.log_buffer import LogBuffer
+    from service.services.log_buffer import LogBuffer
 
     warehouse = WarehouseManager(str(config_path))
     warehouse.ensure_warehouse()
@@ -165,7 +165,7 @@ def describe_log_streams():
 
 
 def put_log_events():
-    from cloudwatch_local_service.services.log_store import log_store
+    from service.services.log_store import log_store
     import time
 
     data = request.get_json(force=True)
@@ -341,7 +341,7 @@ def filter_log_events():
 
 
 def start_query_execution():
-    from cloudwatch_local_service.routes.query import execute_query_internal
+    from service.routes.query import execute_query_internal
 
     data = request.get_json(force=True) or {}
 
@@ -364,7 +364,7 @@ def start_query_execution():
 
 
 def get_query_execution_results():
-    from cloudwatch_local_service.routes.query import get_query_results_internal
+    from service.routes.query import get_query_results_internal
 
     data = request.get_json(force=True) or {}
     query_id = data.get("queryId")

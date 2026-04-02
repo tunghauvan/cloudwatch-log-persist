@@ -94,7 +94,7 @@ class LogStore:
         end_time: Optional[int] = None,
         limit: int = 100,
     ) -> List[Dict]:
-        from cloudwatch_local_service.utils.helpers import parse_filter_pattern
+        from service.utils.helpers import parse_filter_pattern
 
         key_prefix = f"{log_group_name}/"
         with self._lock:
