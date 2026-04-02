@@ -601,7 +601,17 @@ def loki_query_range():
         f"[Debug] Parsed filter: group={log_group}, stream={log_stream}, labels={labels_filter}"
     )
 
+    # If labels_filter has service_name but warehouse uses service (or vice versa)
+    # The warehouse.get_logs already does some mapping, but we should ensure consistency
+    
     try:
+        # Pre-process labels_filter to ensure it matches warehouse expectations
+        # Warehouse expects 'service' if 'service_name' is passed in LogQL
+        warehousing_labels = {}
+        for k, v in labels_filter.items():
+            mapped_key = {"service_name": "service"}.get(k, k)
+            warehousing_labels[mapped_key] = v
+
         # Remove fetch limit as requested to ensure all logs in range are processed
         events = warehouse.get_logs(
             table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
@@ -610,43 +620,23 @@ def loki_query_range():
             start_time=start,
             end_time=end,
             limit=None,  # No limit, fetch all logs in the time range
-            labels_filter=labels_filter,
+            labels_filter=warehousing_labels,
         )
-        logger.debug(f" Warehouse returned {len(events)} events before filtering")
+        logger.debug(f" Warehouse returned {len(events)} events")
     except Exception as e:
-        logger.debug(f" Warehouse error: {e}")
+        logger.error(f" Warehouse error in query_range: {e}", exc_info=True)
         events = []
 
-    filtered_events = []
-    logger.debug(f" Filtering starts for {len(events)} events. Request Limit: {limit}")
-    filtered_events = []
-    # Log the first event keys and all labels found
-    if events:
-        first_e = events[0]
-        logger.debug(f" First event object keys: {list(first_e.keys())}")
-        label_keys = [k for k in first_e.keys() if k.startswith("label_")]
-        if label_keys:
-            print(
-                f"[Debug] Label keys found in first event: {label_keys}, Example values: {[(k, first_e[k]) for k in label_keys]}"
-            )
-        else:
-            logger.debug(f" NO label_ keys found in first event!")
-
-    for e in events:
-        match = True
-        for label_key, label_value in labels_filter.items():
-            # Map label names if needed (Grafana drilldown compatibility)
-            label_mapping = {"service_name": "service"}
-            mapped_key = label_mapping.get(label_key, label_key)
-            storage_key = f"label_{mapped_key}"
-            if e.get(storage_key) != label_value:
-                match = False
-                break
-        if match and message_filter:
-            if message_filter.lower() not in e.get("message", "").lower():
-                match = False
-        if match:
-            filtered_events.append(e)
+    # Since warehouse now does the filtering correctly with labels_filter, 
+    # we can skip the manual loop unless there are additional filter types (like message filter)
+    if message_filter:
+        filtered_events = []
+        msg_filter_lower = message_filter.lower()
+        for e in events:
+            if msg_filter_lower in e.get("message", "").lower():
+                filtered_events.append(e)
+    else:
+        filtered_events = events
 
     logger.debug(f" Filtering done. {len(filtered_events)} events matched.")
     

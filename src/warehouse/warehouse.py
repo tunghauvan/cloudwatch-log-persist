@@ -555,14 +555,14 @@ class WarehouseManager:
                 start_time / 1000.0, tz=timezone.utc
             ).replace(tzinfo=None)
             logger.info(f" Filter start: {ts_start}")
-            filter_expr_parts.append(f"timestamp >= {int(start_time * 1000)}")
+            filter_expr_parts.append(f"timestamp >= '{ts_start.isoformat()}'")
             
         if end_time:
             ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(
                 tzinfo=None
             )
             logger.info(f" Filter end: {ts_end}")
-            filter_expr_parts.append(f"timestamp <= {int(end_time * 1000)}")
+            filter_expr_parts.append(f"timestamp <= '{ts_end.isoformat()}'")
 
         if labels_filter:
             for k, v in labels_filter.items():
@@ -578,11 +578,36 @@ class WarehouseManager:
         result = self.query(filter_expr=filter_expr, limit=limit, table_name=table_name)
 
         events = []
+        # Pre-convert columns to avoid repeated indexing in the loop
+        columns = {
+            "timestamp": result.column("timestamp").to_pylist(),
+            "message": result.column("message").to_pylist(),
+            "ingestion_time": result.column("ingestion_time").to_pylist(),
+        }
+        
+        try:
+            columns["log_group_name"] = result.column("log_group_name").to_pylist()
+        except:
+            columns["log_group_name"] = [None] * result.num_rows
+            
+        try:
+            columns["log_stream_name"] = result.column("log_stream_name").to_pylist()
+        except:
+            columns["log_stream_name"] = [None] * result.num_rows
+            
+        label_columns = self._get_label_columns()
+        label_data = {}
+        for label_col in label_columns:
+            try:
+                label_data[label_col] = result.column(f"label_{label_col}").to_pylist()
+            except:
+                label_data[label_col] = [None] * result.num_rows
+
         for i in range(result.num_rows):
-            ts = result.column("timestamp")[i].as_py()
+            ts = columns["timestamp"][i]
             ts_ms = int(ts.timestamp() * 1000) if ts else 0
 
-            # Manual in-memory timestamp filtering
+            # Manual in-memory timestamp filtering (kept for safety but should be redundant)
             if start_time and ts_ms < start_time:
                 continue
             if end_time and ts_ms > end_time:
@@ -590,38 +615,21 @@ class WarehouseManager:
 
             event = {
                 "timestamp": ts_ms,
-                "message": result.column("message")[i].as_py() or "",
-                "ingestionTime": int(
-                    result.column("ingestion_time")[i].as_py().timestamp() * 1000
-                )
-                if result.column("ingestion_time")[i].as_py()
+                "message": columns["message"][i] or "",
+                "ingestionTime": int(columns["ingestion_time"][i].timestamp() * 1000)
+                if columns["ingestion_time"][i]
                 else 0,
+                "logGroupName": columns["log_group_name"][i] or "",
+                "logStreamName": columns["log_stream_name"][i] or "",
             }
 
-            try:
-                event["logGroupName"] = result.column("log_group_name")[i].as_py() or ""
-            except:
-                pass
-            try:
-                event["logStreamName"] = (
-                    result.column("log_stream_name")[i].as_py() or ""
-                )
-            except:
-                pass
-
-            label_columns = self._get_label_columns()
-            for label_col in label_columns:
-                try:
-                    event[f"label_{label_col}"] = (
-                        result.column(f"label_{label_col}")[i].as_py() or ""
-                    )
-                except:
-                    event[f"label_{label_col}"] = ""
+            for label_col, values in label_data.items():
+                event[f"label_{label_col}"] = values[i] or ""
 
             events.append(event)
 
         events.sort(key=lambda x: x.get("timestamp", 0))
-        return events[:limit]
+        return events[:limit] if limit else events
 
     def compact(self):
         """
