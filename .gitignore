@@ -52,3 +52,4 @@ Thumbs.db
 
 # grafana
 grafana_data/
+wal/

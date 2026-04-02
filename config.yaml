@@ -17,9 +17,11 @@ spark:
   app_name: CloudWatchLogPersist
   master: local[*]
 
-buffer: # In-memory buffer settings (default: 100 logs or 10 seconds)
+buffer: # In-memory buffer & WAL settings
   max_size: 100
   flush_interval_seconds: 10
+  wal_enabled: true
+  wal_dir: wal/
 
 compaction:
   enabled: true

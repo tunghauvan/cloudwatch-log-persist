@@ -25,6 +25,7 @@ services:
       - ./src:/app/src
       - ./data-warehouse:/warehouse
       - ./config.yaml:/app/config.yaml
+      - ./wal:/app/wal
     ports:
       - 4588:4588
     environment:

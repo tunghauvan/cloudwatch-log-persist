@@ -34,6 +34,8 @@ except Exception as e:
 buffer_config = config.get("buffer", {})
 buffer_max_size = buffer_config.get("max_size", 50000)
 buffer_flush_interval = buffer_config.get("flush_interval_seconds", 10)
+wal_enabled = buffer_config.get("wal_enabled", False)
+wal_dir = buffer_config.get("wal_dir", "wal")
 
 try:
     from warehouse.warehouse import WarehouseManager
@@ -44,7 +46,10 @@ try:
     warehouse.start_maintenance()
 
     log_buffer = LogBuffer(
-        max_size=buffer_max_size, flush_interval_seconds=buffer_flush_interval
+        max_size=buffer_max_size,
+        flush_interval_seconds=buffer_flush_interval,
+        wal_enabled=wal_enabled,
+        wal_dir=wal_dir,
     )
     log_buffer.set_warehouse(warehouse)
     log_buffer.start()
@@ -55,7 +60,7 @@ try:
     )
     print(f"[Warehouse] Stats: {stats}")
     print(
-        f"[Buffer] max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s"
+        f"[Buffer] max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s, wal_enabled={wal_enabled}"
     )
 except Exception as e:
     print(f"[Warehouse] Failed to initialize: {e}")
