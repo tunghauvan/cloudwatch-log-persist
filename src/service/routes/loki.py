@@ -558,14 +558,14 @@ def loki_query_range():
     )
 
     try:
-        # Increase the FETCH limit from warehouse before filtering
-        # Use 1000 * 10 to give enough room for label filtering
-        events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
+        # Remove fetch limit as requested to ensure all logs in range are processed
+        events = warehouse.get_logs(
+            table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time=start,
             end_time=end,
-            limit=limit * 10 if limit < 1000 else limit + 2000,
+            limit=None,  # No limit, fetch all logs in the time range
         )
         print(f"[Debug] Warehouse returned {len(events)} events before filtering")
     except Exception as e:
@@ -604,7 +604,11 @@ def loki_query_range():
             filtered_events.append(e)
 
     print(f"[Debug] Filtering done. {len(filtered_events)} events matched.")
-    filtered_events = filtered_events[:limit]
+    
+    # Only apply the limit for regular log queries to keep Grafana happy.
+    # For metric queries, we want to use all matched events.
+    if not is_metric_query(query):
+        filtered_events = filtered_events[:limit]
 
     # Check if this is a metric query (aggregation like count_over_time, sum by, etc.)
     if is_metric_query(query):
@@ -1365,13 +1369,14 @@ def loki_index_volume_range():
 
     if warehouse:
         try:
-            # Query logs to calculate volume by label over time
-            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
+            # Query all logs in the time range without limit to fill the volume chart
+            events = warehouse.get_logs(
+                table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
                 log_group_name=log_group,
                 log_stream_name=log_stream,
                 start_time=start_time,
                 end_time=end_time,
-                limit=limit * 10,
+                limit=None, # No limit, fetch everything in range
             )
 
             # Group by labels AND time buckets
