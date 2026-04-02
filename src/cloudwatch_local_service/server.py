@@ -206,7 +206,7 @@ def put_log_events():
                     "logStreamName": log_stream_name,
                     "timestamp": event.get("timestamp") * 1000,
                     "message": event.get("message"),
-                    "ingestionTime": ingestion_time * 1000,
+                    "ingestionTime": (event.get("timestamp") or ingestion_time) * 1000,
                     "sequenceToken": new_sequence,
                 }
                 for event in log_events

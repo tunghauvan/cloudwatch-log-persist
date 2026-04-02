@@ -104,9 +104,16 @@ def push_logs():
     """Generate and push logs to Loki"""
     streams = {}
 
-    # Generate 10 logs
-    for _ in range(10):
+    # Generate 10 logs with timestamp spread to avoid clustering
+    base_time_ns = int(time.time() * 1_000_000_000)
+    for i in range(10):
+        # Add random offset (0-200ms) to spread timestamps
+        timestamp_offset_ns = int(random.uniform(0, 200_000_000))  # 200ms spread
         entry = generate_log_entry()
+        
+        # Override timestamp with spread value
+        entry["values"][0][0] = str(base_time_ns + timestamp_offset_ns)
+        
         stream_key = tuple(sorted(entry["stream"].items()))
 
         if stream_key not in streams:
@@ -123,7 +130,7 @@ def push_logs():
             LOKI_URL, json=payload, headers={"Content-Type": "application/json"}
         )
         if response.status_code == 200:
-            print(f"[{datetime.now().isoformat()}] Pushed {len(streams)} streams")
+            print(f"[{datetime.now().isoformat()}] Pushed {len(streams)} streams with {sum(len(s['values']) for s in streams.values())} logs")
         else:
             print(
                 f"[{datetime.now().isoformat()}] Error: {response.status_code} - {response.text}"

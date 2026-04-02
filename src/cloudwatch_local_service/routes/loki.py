@@ -190,7 +190,7 @@ def loki_push():
                 "logStreamName": log_stream,
                 "timestamp": timestamp_us,
                 "message": message,
-                "ingestionTime": ingestion_time * 1000, # ms to us
+                "ingestionTime": timestamp_us, # Use log timestamp for ingestion_time
                 "sequenceToken": 0,
             }
             
@@ -580,26 +580,46 @@ def loki_query_range():
 
     # Check if this is a metric query (aggregation like count_over_time, sum by, etc.)
     if is_metric_query(query):
-        # Parse step parameter (default to 60 seconds)
+        # Parse step parameter - auto-calculate if empty
         step_str = (
-            request.args.get("step", "60")
+            request.args.get("step", "")
             if request.method == "GET"
-            else (request.json or {}).get("step", "60")
+            else (request.json or {}).get("step", "")
         )
-        try:
-            if isinstance(step_str, str):
-                if step_str.endswith("s"):
-                    step_seconds = int(step_str[:-1])
-                elif step_str.endswith("m"):
-                    step_seconds = int(step_str[:-1]) * 60
-                elif step_str.endswith("h"):
-                    step_seconds = int(step_str[:-1]) * 3600
+        
+        # Get maxDataPoints for auto step calculation
+        max_data_points = int(
+            request.args.get("maxDataPoints", 500)
+            if request.method == "GET"
+            else (request.json or {}).get("maxDataPoints", 500)
+        )
+        
+        # Auto-calculate step if not provided
+        if not step_str or step_str == "":
+            # Calculate step based on time range and max data points
+            # Converting start/end from ms to seconds first
+            range_seconds = (end - start) / 1000.0
+            auto_step = max(1, int(range_seconds / max(max_data_points, 1)))
+            step_seconds = auto_step
+            print(f"[Debug] Auto-calculated step: {step_seconds}s from range {range_seconds}s and maxDataPoints {max_data_points}")
+        else:
+            try:
+                if isinstance(step_str, str):
+                    if step_str.endswith("s"):
+                        step_seconds = int(step_str[:-1])
+                    elif step_str.endswith("m"):
+                        step_seconds = int(step_str[:-1]) * 60
+                    elif step_str.endswith("h"):
+                        step_seconds = int(step_str[:-1]) * 3600
+                    else:
+                        step_seconds = int(float(step_str))
                 else:
-                    step_seconds = int(float(step_str))
-            else:
-                step_seconds = int(step_str)
-        except:
-            step_seconds = 60
+                    step_seconds = int(step_str)
+            except:
+                # Fallback to auto-calculate
+                range_seconds = (end - start) / 1000.0
+                step_seconds = max(1, int(range_seconds / max(max_data_points, 1)))
+                print(f"[Debug] Step parse failed, using auto-calculated: {step_seconds}s")
 
         # Extract aggregation label (e.g., "by (detected_level)")
         agg_label = None

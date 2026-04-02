@@ -120,7 +120,7 @@ def ingest_logs():
             "logStreamName": log_stream,
             "timestamp": timestamp_ms * 1000, # ms to us
             "message": msg if isinstance(msg, str) else json.dumps(msg),
-            "ingestionTime": ingestion_time * 1000, # ms to us
+            "ingestionTime": timestamp_ms * 1000, # Use event timestamp for ingestion time
             "sequenceToken": 0,
         }
 
