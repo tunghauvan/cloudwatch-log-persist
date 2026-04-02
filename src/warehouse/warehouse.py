@@ -204,28 +204,26 @@ class WarehouseManager:
         except Exception:
             pass
 
+        # Create CloudWatch logs table
         table_id = f"{self.namespace}.{self.table_name}"
-
         try:
             self._table = self.catalog.create_table(
                 table_id,
                 schema=self._get_schema(),
                 partition_spec=self._get_partition_spec(),
             )
-            print(f"[Warehouse] Created table with partition spec")
+            print(f"[Warehouse] Created CloudWatch logs table with partition spec")
         except Exception as e:
-            print(f"[Warehouse] Create table exception: {type(e).__name__}: {e}")
-            print(f"[Warehouse] Attempting to check and repair catalog...")
-
+            print(f"[Warehouse] CloudWatch table exception: {type(e).__name__}: {e}")
             if self._check_and_repair_catalog():
                 try:
                     self._table = self.catalog.load_table(table_id)
-                    print(f"[Warehouse] Repaired and loaded table")
+                    print(f"[Warehouse] Loaded existing CloudWatch logs table")
                 except Exception as load_err:
-                    print(f"[Warehouse] Load after repair failed: {load_err}")
+                    print(f"[Warehouse] Load CloudWatch table failed: {load_err}")
                     raise
             else:
-                print(f"[Warehouse] Repair failed, re-raising original exception")
+                print(f"[Warehouse] Repair failed")
                 raise e
 
     def _check_and_repair_catalog(self) -> bool:
@@ -457,6 +455,7 @@ class WarehouseManager:
 
         # Always reload table to get fresh data files
         table_id = f"{self.namespace}.{self.table_name}"
+            
         try:
             self._table = self.catalog.load_table(table_id)
         except Exception as e:
@@ -470,13 +469,13 @@ class WarehouseManager:
             raise
 
         try:
-            print(f"[Warehouse] Running query with filter: {filter_expr}")
+            print(f"[Warehouse] Running query on {self.table_name} with filter: {filter_expr}")
             scan = self._table.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
 
             result = scan.to_arrow()
-            print(f"[Warehouse] Query returned {len(result)} rows")
+            print(f"[Warehouse] Query returned {len(result)} rows from {self.table_name}")
         except FileNotFoundError as e:
             print(f"[Warehouse] Data file not found, rebuilding table: {e}")
             self._repair_missing_data_files()

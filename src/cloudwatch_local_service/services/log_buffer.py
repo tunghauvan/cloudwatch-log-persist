@@ -45,7 +45,6 @@ class LogBuffer:
     def add(self, logs: List[Dict[str, Any]]):
         with self._lock:
             self._buffer.extend(logs)
-            # Don't reset _last_flush_time here - let it be reset only on actual flush
 
         if len(self._buffer) >= self.max_size:
             try:
@@ -64,6 +63,11 @@ class LogBuffer:
 
         if self._warehouse and logs_to_write:
             try:
+                # Remove any table metadata
+                for log in logs_to_write:
+                    log.pop("_warehouse_table", None)
+                
+                # Insert all logs into the configured table
                 self._warehouse.insert_logs(logs_to_write)
                 return len(logs_to_write)
             except Exception as e:
