@@ -612,7 +612,7 @@ class WarehouseManager:
 
             events.append(event)
 
-        events.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        events.sort(key=lambda x: x.get("timestamp", 0))
         return events[:limit]
 
     def compact(self):

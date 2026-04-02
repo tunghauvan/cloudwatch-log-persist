@@ -82,7 +82,7 @@ class LogStore:
 
                 events.extend(filtered)
 
-            events.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+            events.sort(key=lambda x: x.get("timestamp", 0))
             return events[:limit]
 
     def filter_events(
@@ -129,7 +129,7 @@ class LogStore:
 
                 events.extend(filtered)
 
-            events.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+            events.sort(key=lambda x: x.get("timestamp", 0))
             return events[:limit]
 
     def get_all_log_groups(self) -> Dict[str, Dict]:
