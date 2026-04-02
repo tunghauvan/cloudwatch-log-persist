@@ -228,6 +228,8 @@ def loki_push():
         )
         return jsonify({"status": "ok"}), 200
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         loki_metrics.record_push(
             logs_count=total_logs, streams_count=stream_count, error=True
         )

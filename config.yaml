@@ -20,6 +20,7 @@ spark:
 buffer: # In-memory buffer & WAL settings
   max_size: 100
   flush_interval_seconds: 10
+  worker_threads: 2
   wal_enabled: true
   wal_dir: wal/
 

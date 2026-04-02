@@ -20,6 +20,7 @@ class LogBuffer:
         flush_interval_seconds: int = 5,
         wal_enabled: bool = False,
         wal_dir: str = "wal",
+        worker_threads: int = 2,
     ):
         self.max_size = max_size
         self.flush_interval_seconds = flush_interval_seconds
@@ -33,6 +34,11 @@ class LogBuffer:
         self._warehouse = None
         self._last_error: Optional[str] = None
         self._current_wal_file: Optional[Path] = None
+
+        # Background worker pool for flushing
+        self._flush_queue = queue.Queue()
+        self._worker_threads: List[threading.Thread] = []
+        self._num_workers = worker_threads
 
         if self.wal_enabled:
             self.wal_dir.mkdir(parents=True, exist_ok=True)
@@ -76,50 +82,46 @@ class LogBuffer:
             self._stop_event.clear()
             self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
             self._flush_thread.start()
+        
+        # Start worker threads
+        if not self._worker_threads:
+            for i in range(self._num_workers):
+                t = threading.Thread(target=self._worker_loop, name=f"LogWorker-{i}", daemon=True)
+                t.start()
+                self._worker_threads.append(t)
+            print(f"[LogBuffer] Started {self._num_workers} worker threads.")
 
     def stop(self):
         self._stop_event.set()
+        
+        # Wait for workers to finish current tasks
+        print(f"[LogBuffer] Stopping workers and flushing remaining logs...")
+        for t in self._worker_threads:
+            t.join(timeout=5)
+            
         if self._flush_thread:
             self._flush_thread.join(timeout=10)
+        
+        # Final explicit flush of whatever is in memory buffer
         self.flush()
 
-    def _write_to_wal(self, logs: List[Dict[str, Any]]) -> Optional[Path]:
-        if not self.wal_enabled:
-            return None
-        
-        wal_file = self._get_active_wal_file()
-        
-        try:
-            with open(wal_file, "a") as f: # Append mode
-                for log in logs:
-                    f.write(json.dumps(log) + "\n")
-            return wal_file
-        except Exception as e:
-            print(f"[LogBuffer] WAL Write Error: {e}")
-            self._last_error = f"WAL Write Error: {e}"
-            return None
-
-    def add(self, logs: List[Dict[str, Any]]):
-        wal_file = self._write_to_wal(logs)
-        
-        with self._lock:
-            self._buffer.extend(logs)
-
-        if len(self._buffer) >= self.max_size:
+    def _worker_loop(self):
+        """Background worker consuming logs from the queue and writing to warehouse."""
+        while not self._stop_event.is_set() or not self._flush_queue.empty():
             try:
-                self.flush()
+                # Use a small timeout to allow checking stop_event periodically
+                logs_to_write = self._flush_queue.get(timeout=1.0)
+                if logs_to_write:
+                    self._perform_flush(logs_to_write)
+                self._flush_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception as e:
-                self._last_error = str(e)
+                print(f"[LogBuffer] Worker error: {e}")
+                self._last_error = f"Worker Error: {e}"
 
-    def flush(self) -> int:
-        with self._lock:
-            if not self._buffer:
-                return 0
-
-            logs_to_write = self._buffer.copy()
-            self._buffer.clear()
-            self._last_flush_time = time.time()
-
+    def _perform_flush(self, logs_to_write: List[Dict[str, Any]]):
+        """Actual logic to write logs to warehouse."""
         if self._warehouse and logs_to_write:
             try:
                 # Remove any table metadata
@@ -142,6 +144,43 @@ class LogBuffer:
                     self._buffer = logs_to_write + self._buffer
                 return 0
         return 0
+
+    def _write_to_wal(self, logs: List[Dict[str, Any]]):
+        """Write logs to the active WAL file."""
+        if not self.wal_enabled:
+            return None
+            
+        try:
+            wal_file = self._get_active_wal_file()
+            with open(wal_file, "a") as f:
+                for log in logs:
+                    f.write(json.dumps(log) + "\n")
+            return wal_file
+        except Exception as e:
+            print(f"[LogBuffer] WAL Write Error: {e}")
+            return None
+
+    def add(self, logs: List[Dict[str, Any]]):
+        wal_file = self._write_to_wal(logs)
+        
+        with self._lock:
+            self._buffer.extend(logs)
+
+        if len(self._buffer) >= self.max_size:
+            self.flush()
+
+    def flush(self) -> int:
+        with self._lock:
+            if not self._buffer:
+                return 0
+
+            logs_to_write = self._buffer.copy()
+            self._buffer.clear()
+            self._last_flush_time = time.time()
+
+        # Enqueue for background worker instead of blocking
+        self._flush_queue.put(logs_to_write)
+        return len(logs_to_write)
 
     def _cleanup_wal(self):
         """Remove processed WAL files and reset active file."""
@@ -181,6 +220,8 @@ class LogBuffer:
                 "flush_interval_seconds": self.flush_interval_seconds,
                 "last_flush_age_seconds": time.time() - self._last_flush_time,
                 "last_error": self._last_error,
+                "queue_size": self._flush_queue.qsize(),
+                "num_workers": len(self._worker_threads),
             }
 
 
