@@ -1,7 +1,13 @@
-warehouse: file:///warehouse
+warehouse: s3a://warehouse/
 catalog: postgresql
 namespace: default
 table_name: cloudwatch_logs
+
+s3:
+  endpoint: http://minio:9000
+  access_key: admin
+  secret_key: admin123
+  region: us-east-1
 
 cloudwatch:
   endpoint_url: http://localhost:4588
@@ -11,9 +17,9 @@ spark:
   app_name: CloudWatchLogPersist
   master: local[*]
 
-buffer:
-  max_size: 50000
-  flush_interval_seconds: 60
+buffer: # In-memory buffer settings (default: 100 logs or 10 seconds)
+  max_size: 100
+  flush_interval_seconds: 10
 
 compaction:
   enabled: true

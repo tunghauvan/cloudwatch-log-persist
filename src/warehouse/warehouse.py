@@ -61,6 +61,13 @@ class SparkManager:
             f"spark.sql.catalog.spark_catalog.uri": f"postgresql://{user}:{password}@{host}:{port}/{name}",
             "spark.sql.warehouse.dir": self.warehouse_path,
             "spark.local.dir": "/tmp/spark",
+            "spark.hadoop.fs.s3a.endpoint": self.config.get("s3", {}).get("endpoint", "http://localhost:9000"),
+            "spark.hadoop.fs.s3a.access.key": self.config.get("s3", {}).get("access_key", "admin"),
+            "spark.hadoop.fs.s3a.secret.key": self.config.get("s3", {}).get("secret_key", "admin123"),
+            "spark.hadoop.fs.s3a.path.style.access": "true",
+            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+            "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+            "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
         }
 
     def get_spark(self) -> SparkSession:
@@ -126,7 +133,7 @@ class WarehouseManager:
     def spark(self) -> Optional[SparkManager]:
         if self._spark_manager is None and PYSPARK_AVAILABLE:
             self._spark_manager = SparkManager(
-                self.config, str(self._warehouse_dir.absolute())
+                self.config, self.warehouse_path
             )
         return self._spark_manager
 
@@ -136,7 +143,8 @@ class WarehouseManager:
             raise RuntimeError("PyIceberg is not installed")
 
         if self._catalog is None:
-            self._warehouse_dir.mkdir(parents=True, exist_ok=True)
+            if not self.warehouse_path.startswith("s3"):
+                self._warehouse_dir.mkdir(parents=True, exist_ok=True)
 
             if self.catalog_name == "postgresql":
                 db_config = self.config.get("database", {})
@@ -145,13 +153,22 @@ class WarehouseManager:
                 name = db_config.get("name", "iceberg_db")
                 user = db_config.get("user", "admin")
                 password = db_config.get("password", "admin123")
-                self._catalog = load_catalog(
-                    "sql",
-                    **{
-                        "uri": f"postgresql://{user}:{password}@{host}:{port}/{name}",
-                        "warehouse": str(self._warehouse_dir.absolute()),
-                    },
-                )
+                
+                catalog_props = {
+                    "uri": f"postgresql://{user}:{password}@{host}:{port}/{name}",
+                    "warehouse": self.warehouse_path,
+                }
+                
+                if self.warehouse_path.startswith("s3"):
+                    s3_config = self.config.get("s3", {})
+                    catalog_props.update({
+                        "s3.endpoint": s3_config.get("endpoint", "http://localhost:9000"),
+                        "s3.access-key-id": s3_config.get("access_key", "admin"),
+                        "s3.secret-access-key": s3_config.get("secret_key", "admin123"),
+                        "s3.region": s3_config.get("region", "us-east-1"),
+                    })
+                
+                self._catalog = load_catalog("sql", **catalog_props)
             else:
                 db_path = self._warehouse_dir / "catalog.db"
                 self._catalog = load_catalog(
@@ -213,23 +230,19 @@ class WarehouseManager:
         # Create CloudWatch logs table
         table_id = f"{self.namespace}.{self.table_name}"
         try:
-            self._table = self.catalog.create_table(
-                table_id,
-                schema=self._get_schema(),
-                partition_spec=self._get_partition_spec(),
-            )
-            print(f"[Warehouse] Created CloudWatch logs table with partition spec")
-        except Exception as e:
-            print(f"[Warehouse] CloudWatch table exception: {type(e).__name__}: {e}")
-            if self._check_and_repair_catalog():
-                try:
-                    self._table = self.catalog.load_table(table_id)
-                    print(f"[Warehouse] Loaded existing CloudWatch logs table")
-                except Exception as load_err:
-                    print(f"[Warehouse] Load CloudWatch table failed: {load_err}")
-                    raise
-            else:
-                print(f"[Warehouse] Repair failed")
+            # Check if table already exists in catalog
+            self._table = self.catalog.load_table(table_id)
+            print(f"[Warehouse] Loaded existing CloudWatch logs table: {table_id}")
+        except Exception:
+            try:
+                self._table = self.catalog.create_table(
+                    table_id,
+                    schema=self._get_schema(),
+                    partition_spec=self._get_partition_spec(),
+                )
+                print(f"[Warehouse] Created new CloudWatch logs table: {table_id}")
+            except Exception as e:
+                print(f"[Warehouse] CloudWatch table exception: {type(e).__name__}: {e}")
                 raise e
 
     def _check_and_repair_catalog(self) -> bool:
