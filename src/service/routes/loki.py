@@ -1,8 +1,14 @@
 import sys
 from pathlib import Path
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response
 import time
 import re
+from collections import defaultdict
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -80,50 +86,85 @@ def parse_logql_filter(filter_expr):
     return log_group, log_stream, message_filter, labels_filter, regex_label
 
 
+def create_loki_response(status, result, result_type, logs_count=0, bytes_count=0):
+    """Create a Loki response using orjson for fast serialization."""
+    response_dict = {
+        "status": status,
+        "data": {
+            "resultType": result_type,
+            "result": result,
+            "stats": {
+                "summary": {
+                    "bytesProcessed": bytes_count,
+                    "linesProcessed": logs_count,
+                    "totalLinesProcessed": logs_count,
+                    "totalBytesProcessed": bytes_count,
+                    "totalEvents": logs_count,
+                    "execTime": 0.001,
+                }
+            },
+        },
+    }
+    
+    if HAS_ORJSON:
+        return Response(orjson.dumps(response_dict), mimetype="application/json")
+    else:
+        return jsonify(response_dict)
+
+
+def convert_timestamp_to_ns(timestamp):
+    """Convert timestamp to nanoseconds efficiently."""
+    if isinstance(timestamp, int):
+        if timestamp > 1e18:  # Already nanoseconds
+            return str(timestamp)
+        elif timestamp > 1e15:  # Microseconds
+            return str(timestamp * 1000)
+        elif timestamp > 1e11:  # Milliseconds
+            return str(timestamp * 1000000)
+        else:  # Seconds
+            return str(timestamp * 1000000000)
+    else:
+        return str(int(timestamp) * 1000000)
+
+
 def logs_to_loki_streams(logs):
-    streams = {}
+    """Convert logs to Loki streams format optimized for speed."""
+    if not logs:
+        return []
+    
+    streams = defaultdict(lambda: {"stream": {}, "values": []})
+    
     for log in logs:
+        # Build labels dict with only non-empty values
         labels = {
             "log_group": log.get("logGroupName", "default"),
             "log_stream": log.get("logStreamName", "default"),
         }
-
-        if "label_env" in log and log["label_env"]:
+        
+        # Add optional labels if present and non-empty
+        if log.get("label_env"):
             labels["env"] = log["label_env"]
-        if "label_service" in log and log["label_service"]:
+        if log.get("label_service"):
             labels["service"] = log["label_service"]
-            # Add service_name alias for Grafana drilldown compatibility
             labels["service_name"] = log["label_service"]
-        if "label_host" in log and log["label_host"]:
+        if log.get("label_host"):
             labels["host"] = log["label_host"]
-        if "label_region" in log and log["label_region"]:
+        if log.get("label_region"):
             labels["region"] = log["label_region"]
-
-        # Use frozenset of sorted items as key for dict
+        
         label_key = tuple(sorted(labels.items()))
-
-        if label_key not in streams:
-            streams[label_key] = {"stream": dict(labels), "values": []}
-
-        timestamp = log.get(
-            "timestamp", log.get("ingestionTime", int(time.time() * 1000))
-        )
-        # Convert to nanoseconds (19 digits for Loki)
-        if isinstance(timestamp, int):
-            if timestamp > 1e18:  # Already nanoseconds
-                timestamp_ns = str(timestamp)
-            elif timestamp > 1e15:  # Already microseconds (16 digits)
-                timestamp_ns = str(timestamp * 1000)
-            elif timestamp > 1e11:  # Milliseconds (13 digits)
-                timestamp_ns = str(timestamp * 1000000)
-            else:  # Seconds
-                timestamp_ns = str(timestamp * 1000000000)
-        else:
-            timestamp_ns = str(int(timestamp) * 1000000)
-
-        # Loki format: values is array of [timestamp, line] arrays
+        
+        # Initialize stream if first time
+        if not streams[label_key]["stream"]:
+            streams[label_key]["stream"] = dict(labels)
+        
+        # Get timestamp and convert to nanoseconds
+        timestamp = log.get("timestamp", log.get("ingestionTime", int(time.time() * 1000)))
+        timestamp_ns = convert_timestamp_to_ns(timestamp)
+        
+        # Append [timestamp, message] pair
         streams[label_key]["values"].append([timestamp_ns, log.get("message", "")])
-
+    
     return list(streams.values())
 
 
@@ -569,6 +610,7 @@ def loki_query_range():
             start_time=start,
             end_time=end,
             limit=None,  # No limit, fetch all logs in the time range
+            labels_filter=labels_filter,
         )
         logger.debug(f" Warehouse returned {len(events)} events before filtering")
     except Exception as e:
@@ -754,45 +796,26 @@ def loki_query_range():
             }
         )
 
-    # Regular log query - return streams
-    logs = []
-    for e in filtered_events:
-        logs.append(
-            {
-                "timestamp": e.get("timestamp", 0),
-                "message": e.get("message", ""),
-                "ingestionTime": e.get("ingestionTime", 0),
-                "logGroupName": e.get("logGroupName", "default"),
-                "logStreamName": e.get("logStreamName", "default"),
-                "label_env": e.get("label_env", ""),
-                "label_service": e.get("label_service", ""),
-                "label_host": e.get("label_host", ""),
-                "label_region": e.get("label_region", ""),
-            }
-        )
+    # Regular log query - return streams (non-streaming for optimal performance)
+    logs = [
+        {
+            "timestamp": e.get("timestamp", 0),
+            "message": e.get("message", ""),
+            "ingestionTime": e.get("ingestionTime", 0),
+            "logGroupName": e.get("logGroupName", "default"),
+            "logStreamName": e.get("logStreamName", "default"),
+            "label_env": e.get("label_env", ""),
+            "label_service": e.get("label_service", ""),
+            "label_host": e.get("label_host", ""),
+            "label_region": e.get("label_region", ""),
+        }
+        for e in filtered_events
+    ]
 
     streams = logs_to_loki_streams(logs)
 
     loki_metrics.record_query_range(logs_returned=len(logs), error=False)
-    return jsonify(
-        {
-            "status": "success",
-            "data": {
-                "resultType": "streams",
-                "result": streams,
-                "stats": {
-                    "summary": {
-                        "bytesProcessed": 0,
-                        "linesProcessed": len(logs),
-                        "totalLinesProcessed": len(logs),
-                        "totalBytesProcessed": 0,
-                        "totalEvents": len(logs),
-                        "execTime": 0.0,
-                    }
-                },
-            },
-        }
-    )
+    return create_loki_response("success", streams, "streams", logs_count=len(logs))
 
 
 @loki_bp.route("/loki/api/v1/label", methods=["GET"])

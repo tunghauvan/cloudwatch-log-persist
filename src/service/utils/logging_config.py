@@ -21,7 +21,7 @@ def setup_logging():
     )
     
     # Reduce noise from 3rd party libraries if needed
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("boto3").setLevel(logging.WARNING)
     logging.getLogger("botocore").setLevel(logging.WARNING)

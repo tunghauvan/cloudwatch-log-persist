@@ -540,6 +540,7 @@ class WarehouseManager:
         end_time: Optional[int] = None,
         limit: int = 100,
         table_name: Optional[str] = None,
+        labels_filter: Optional[Dict[str, str]] = None,
     ):
         filter_expr_parts = []
         if log_group_name:
@@ -555,6 +556,7 @@ class WarehouseManager:
             ).replace(tzinfo=None)
             logger.info(f" Filter start: {ts_start}")
             filter_expr_parts.append(f"timestamp >= {int(start_time * 1000)}")
+            
         if end_time:
             ts_end = datetime.fromtimestamp(end_time / 1000.0, tz=timezone.utc).replace(
                 tzinfo=None
@@ -562,13 +564,17 @@ class WarehouseManager:
             logger.info(f" Filter end: {ts_end}")
             filter_expr_parts.append(f"timestamp <= {int(end_time * 1000)}")
 
-        if start_time:
-            # Get everything and filter in memory if Iceberg filter is being tricky
-            logger.info(f" Requesting all data due to filtering issues")
-            filter_expr = None
-        else:
-            filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
+        if labels_filter:
+            for k, v in labels_filter.items():
+                # Map common Grafana labels to internal storage keys
+                label_mapping = {"service_name": "service"}
+                mapped_key = label_mapping.get(k, k)
+                storage_key = f"label_{mapped_key}"
+                filter_expr_parts.append(f"{storage_key} == '{v}'")
 
+        filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
+        
+        # If we have a filter, let's use it!
         result = self.query(filter_expr=filter_expr, limit=limit, table_name=table_name)
 
         events = []

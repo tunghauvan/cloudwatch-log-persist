@@ -7,3 +7,4 @@ psycopg2-binary>=2.9.9
 pyspark>=3.5.0
 lark>=1.1.0
 pandas>=2.0.0
+orjson>=3.9.0
