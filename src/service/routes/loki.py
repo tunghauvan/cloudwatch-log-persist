@@ -174,6 +174,8 @@ def loki_push():
     total_logs = 0
     stream_count = len(streams)
 
+    loki_table = warehouse.config.get("loki", {}).get("table_name", "loki_logs")
+
     for stream in streams:
         labels_str = stream.get("stream", {})
         log_group = (
@@ -200,6 +202,7 @@ def loki_push():
                 "message": message,
                 "ingestionTime": timestamp_us,  # Use log timestamp for ingestion_time
                 "sequenceToken": 0,
+                "_warehouse_table": loki_table,
             }
 
             # Map ALL stream labels to label_ prefix for storage
@@ -441,7 +444,7 @@ def loki_query():
     end_time = int(time.time() * 1000)
 
     try:
-        events = warehouse.get_logs(
+        events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time=start_time,
@@ -557,7 +560,7 @@ def loki_query_range():
     try:
         # Increase the FETCH limit from warehouse before filtering
         # Use 1000 * 10 to give enough room for label filtering
-        events = warehouse.get_logs(
+        events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time=start,
@@ -856,7 +859,7 @@ def loki_series():
 
     if warehouse:
         try:
-            events = warehouse.get_logs(
+            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
                 log_group_name=None,
                 log_stream_name=None,
                 start_time=start_time,
@@ -959,7 +962,7 @@ def loki_index_stats():
 
     if warehouse:
         try:
-            events = warehouse.get_logs(
+            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
                 log_group_name=log_group,
                 log_stream_name=log_stream,
                 start_time=start_time,
@@ -1063,7 +1066,7 @@ def loki_index_volume():
     if warehouse:
         try:
             # Query logs to calculate volume by label
-            events = warehouse.get_logs(
+            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
                 log_group_name=log_group,
                 log_stream_name=log_stream,
                 start_time=start_time,
@@ -1363,7 +1366,7 @@ def loki_index_volume_range():
     if warehouse:
         try:
             # Query logs to calculate volume by label over time
-            events = warehouse.get_logs(
+            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
                 log_group_name=log_group,
                 log_stream_name=log_stream,
                 start_time=start_time,
@@ -1575,7 +1578,7 @@ def loki_detected_field_values(name):
 
     if warehouse:
         try:
-            events = warehouse.get_logs(
+            events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 
                 log_group_name=log_group,
                 log_stream_name=log_stream,
                 start_time=start_time,

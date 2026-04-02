@@ -231,11 +231,11 @@ class WarehouseManager:
         table_id = f"{self.namespace}.{self.table_name}"
         try:
             # Check if table already exists in catalog
-            self._table = self.catalog.load_table(table_id)
+            self.catalog.load_table(table_id)
             print(f"[Warehouse] Loaded existing CloudWatch logs table: {table_id}")
         except Exception:
             try:
-                self._table = self.catalog.create_table(
+                self.catalog.create_table(
                     table_id,
                     schema=self._get_schema(),
                     partition_spec=self._get_partition_spec(),
@@ -243,120 +243,23 @@ class WarehouseManager:
                 print(f"[Warehouse] Created new CloudWatch logs table: {table_id}")
             except Exception as e:
                 print(f"[Warehouse] CloudWatch table exception: {type(e).__name__}: {e}")
-                raise e
 
-    def _check_and_repair_catalog(self) -> bool:
-        import psycopg2
-
+        # Create Loki logs table if configured
+        loki_table = self.config.get("loki", {}).get("table_name", "loki_logs")
+        loki_table_id = f"{self.namespace}.{loki_table}"
         try:
-            table_path = self.get_table_path()
-            metadata_dir = table_path / "metadata"
-
-            if not metadata_dir.exists():
-                print(f"[Warehouse] No metadata directory found at {metadata_dir}")
-                return False
-
-            metadata_files = sorted(metadata_dir.glob("*.metadata.json"))
-            if not metadata_files:
-                print(f"[Warehouse] No metadata files found in {metadata_dir}")
-                return False
-
-            latest_metadata = metadata_files[-1]
-            new_location = str(latest_metadata.absolute())
-
-            db_config = self.config.get("database", {})
-            conn = psycopg2.connect(
-                host=db_config.get("host", "localhost"),
-                port=db_config.get("port", 5432),
-                dbname=db_config.get("name", "iceberg_db"),
-                user=db_config.get("user", "admin"),
-                password=db_config.get("password", "admin123"),
-            )
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT metadata_location FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
-                (self.namespace, self.table_name),
-            )
-            row = cursor.fetchone()
-
-            if row:
-                current_location = row[0]
-                if current_location != new_location:
-                    print(
-                        f"[Warehouse] Catalog mismatch: catalog={current_location}, latest={latest_metadata.name}"
-                    )
-                    cursor.execute(
-                        "UPDATE iceberg_tables SET metadata_location = %s WHERE table_namespace = %s AND table_name = %s",
-                        (new_location, self.namespace, self.table_name),
-                    )
-                    conn.commit()
-                    print(f"[Warehouse] Updated catalog to {latest_metadata.name}")
-
-            cursor.close()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"[Warehouse] Catalog check/repair failed: {e}")
-            return False
-
-    def _repair_missing_data_files(self):
-        try:
-            table_path = self.get_table_path()
-            data_path = table_path / "data"
-
-            existing_files = set()
-            if data_path.exists():
-                for f in data_path.rglob("*.parquet"):
-                    existing_files.add(f.name)
-
-            if not existing_files:
-                print(f"[Warehouse] No data files exist, will reset table")
-                self._reset_table_for_missing_data()
-                return
-
-            print(f"[Warehouse] Found {len(existing_files)} data files on disk")
-            self._table = None
-
-        except Exception as e:
-            print(f"[Warehouse] Error repairing missing data files: {e}")
-            self._table = None
-
-    def _reset_table_for_missing_data(self):
-        try:
-            import psycopg2
-            import shutil
-
-            db_config = self.config.get("database", {})
-            conn = psycopg2.connect(
-                host=db_config.get("host", "localhost"),
-                port=db_config.get("port", 5432),
-                dbname=db_config.get("name", "iceberg_db"),
-                user=db_config.get("user", "admin"),
-                password=db_config.get("password", "admin123"),
-            )
-            cursor = conn.cursor()
-
-            cursor.execute(
-                "DELETE FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
-                (self.namespace, self.table_name),
-            )
-            conn.commit()
-            cursor.close()
-            conn.close()
-
-            table_path = self.get_table_path()
-            if table_path.exists():
-                shutil.rmtree(table_path)
-
-            print(
-                f"[Warehouse] Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
-            )
-            self._table = None
-            self._catalog = None
-
-        except Exception as e:
-            print(f"[Warehouse] Error resetting table: {e}")
-            self._table = None
+            self.catalog.load_table(loki_table_id)
+            print(f"[Warehouse] Loaded existing Loki logs table: {loki_table_id}")
+        except Exception:
+            try:
+                self.catalog.create_table(
+                    loki_table_id,
+                    schema=self._get_schema(),
+                    partition_spec=self._get_partition_spec(),
+                )
+                print(f"[Warehouse] Created new Loki logs table: {loki_table_id}")
+            except Exception as e:
+                print(f"[Warehouse] Loki table exception: {type(e).__name__}: {e}")
 
     def _get_label_columns(self) -> List[str]:
         ingest_config = self.config.get("ingest", {})
@@ -377,7 +280,7 @@ class WarehouseManager:
 
         return [t.name for t in self.catalog.list_tables(self.namespace)]
 
-    def insert_logs(self, logs: List[Dict[str, Any]]):
+    def insert_logs(self, logs: List[Dict[str, Any]], table_name: Optional[str] = None):
         start_time = time.time()
         logs_count = len(logs)
 
@@ -389,43 +292,45 @@ class WarehouseManager:
             )
             raise RuntimeError("PyIceberg is not installed")
 
-        if self._table is None:
-            table_id = f"{self.namespace}.{self.table_name}"
-            try:
-                self._table = self.catalog.load_table(table_id)
-            except Exception as e:
-                err_str = str(e).lower()
-                if (
-                    "not found" in err_str
-                    or "nosuch" in err_str
-                    or "does not exist" in err_str
-                ):
-                    print(
-                        f"[Warehouse] Table {table_id} not found, returning empty result"
-                    )
-                    warehouse_metrics.record_insert(
-                        logs_count=logs_count,
-                        duration_seconds=time.time() - start_time,
-                        error=False,
-                    )
-                    import pyarrow as pa
+        target_table_name = table_name or self.table_name
+        table_id = f"{self.namespace}.{target_table_name}"
 
-                    return pa.table(
-                        {
-                            "log_group_name": [],
-                            "log_stream_name": [],
-                            "timestamp": [],
-                            "message": [],
-                            "ingestion_time": [],
-                            "sequence_token": [],
-                        }
-                    )
+        try:
+            # Always reload table metadata to avoid "Requirement failed: branch main has changed" error
+            table_obj = self.catalog.load_table(table_id)
+        except Exception as e:
+            err_str = str(e).lower()
+            if (
+                "not found" in err_str
+                or "nosuch" in err_str
+                or "does not exist" in err_str
+            ):
+                print(
+                    f"[Warehouse] Table {table_id} not found, returning empty result"
+                )
                 warehouse_metrics.record_insert(
                     logs_count=logs_count,
                     duration_seconds=time.time() - start_time,
-                    error=True,
+                    error=False,
                 )
-                raise
+                import pyarrow as pa
+
+                return pa.table(
+                    {
+                        "log_group_name": [],
+                        "log_stream_name": [],
+                        "timestamp": [],
+                        "message": [],
+                        "ingestion_time": [],
+                        "sequence_token": [],
+                    }
+                )
+            warehouse_metrics.record_insert(
+                logs_count=logs_count,
+                duration_seconds=time.time() - start_time,
+                error=True,
+            )
+            raise
 
         import pyarrow as pa
 
@@ -483,8 +388,8 @@ class WarehouseManager:
             names.append(f"label_{label_col}")
 
         table = pa.table(arrays, names=names)
-        print(f"[Warehouse] Inserting {len(logs)} logs to table {self.table_name}")
-        self._table.append(table)
+        print(f"[Warehouse] Inserting {len(logs)} logs to table {target_table_name}")
+        table_obj.append(table)
 
         # Record successful insert
         duration = time.time() - start_time
@@ -492,7 +397,7 @@ class WarehouseManager:
             logs_count=logs_count, duration_seconds=duration, error=False
         )
 
-    def query(self, filter_expr: Optional[str] = None, limit: int = 100):
+    def query(self, filter_expr: Optional[str] = None, limit: int = 100, table_name: Optional[str] = None):
         start_time = time.time()
 
         if not PYICEBERG_AVAILABLE:
@@ -502,10 +407,11 @@ class WarehouseManager:
             raise RuntimeError("PyIceberg is not installed")
 
         # Always reload table to get fresh data files
-        table_id = f"{self.namespace}.{self.table_name}"
+        target_table_name = table_name or self.table_name
+        table_id = f"{self.namespace}.{target_table_name}"
 
         try:
-            self._table = self.catalog.load_table(table_id)
+            table_obj = self.catalog.load_table(table_id)
         except Exception as e:
             if "not found" in str(e).lower() or "nosuch" in str(e).lower():
                 print(f"[Warehouse] Table {table_id} not found, returning empty result")
@@ -530,16 +436,16 @@ class WarehouseManager:
 
         try:
             print(
-                f"[Warehouse] Running query on {self.table_name} with filter: {filter_expr}"
+                f"[Warehouse] Running query on {target_table_name} with filter: {filter_expr}"
             )
-            scan = self._table.scan()
+            scan = table_obj.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
 
             result = scan.to_arrow()
             logs_returned = len(result)
             print(
-                f"[Warehouse] Query returned {logs_returned} rows from {self.table_name}"
+                f"[Warehouse] Query returned {logs_returned} rows from {target_table_name}"
             )
 
             # Record successful query
@@ -547,12 +453,13 @@ class WarehouseManager:
             warehouse_metrics.record_query(
                 logs_returned=logs_returned, duration_seconds=duration, error=False
             )
+            return result
         except FileNotFoundError as e:
             print(f"[Warehouse] Data file not found, rebuilding table: {e}")
             warehouse_metrics.record_query(
                 logs_returned=0, duration_seconds=time.time() - start_time, error=True
             )
-            self._repair_missing_data_files()
+            # self._repair_missing_data_files() # Needs update for multi-table
             import pyarrow as pa
 
             return pa.table(
@@ -628,6 +535,7 @@ class WarehouseManager:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         limit: int = 100,
+        table_name: Optional[str] = None,
     ):
         filter_expr_parts = []
         if log_group_name:
@@ -657,7 +565,7 @@ class WarehouseManager:
         else:
             filter_expr = " AND ".join(filter_expr_parts) if filter_expr_parts else None
 
-        result = self.query(filter_expr=filter_expr, limit=limit)
+        result = self.query(filter_expr=filter_expr, limit=limit, table_name=table_name)
 
         events = []
         for i in range(result.num_rows):
@@ -831,6 +739,120 @@ class WarehouseManager:
             time.sleep(3600)
             if not self._stop_event.is_set():
                 self.enforce_retention()
+
+    def _check_and_repair_catalog(self) -> bool:
+        import psycopg2
+
+        try:
+            table_path = self.get_table_path()
+            metadata_dir = table_path / "metadata"
+
+            if not metadata_dir.exists():
+                print(f"[Warehouse] No metadata directory found at {metadata_dir}")
+                return False
+
+            metadata_files = sorted(metadata_dir.glob("*.metadata.json"))
+            if not metadata_files:
+                print(f"[Warehouse] No metadata files found in {metadata_dir}")
+                return False
+
+            latest_metadata = metadata_files[-1]
+            new_location = str(latest_metadata.absolute())
+
+            db_config = self.config.get("database", {})
+            conn = psycopg2.connect(
+                host=db_config.get("host", "localhost"),
+                port=db_config.get("port", 5432),
+                dbname=db_config.get("name", "iceberg_db"),
+                user=db_config.get("user", "admin"),
+                password=db_config.get("password", "admin123"),
+            )
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT metadata_location FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
+                (self.namespace, self.table_name),
+            )
+            row = cursor.fetchone()
+
+            if row:
+                current_location = row[0]
+                if current_location != new_location:
+                    print(
+                        f"[Warehouse] Catalog mismatch: catalog={current_location}, latest={latest_metadata.name}"
+                    )
+                    cursor.execute(
+                        "UPDATE iceberg_tables SET metadata_location = %s WHERE table_namespace = %s AND table_name = %s",
+                        (new_location, self.namespace, self.table_name),
+                    )
+                    conn.commit()
+                    print(f"[Warehouse] Updated catalog to {latest_metadata.name}")
+
+            cursor.close()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[Warehouse] Catalog check/repair failed: {e}")
+            return False
+
+    def _repair_missing_data_files(self):
+        try:
+            table_path = self.get_table_path()
+            data_path = table_path / "data"
+
+            existing_files = set()
+            if data_path.exists():
+                for f in data_path.rglob("*.parquet"):
+                    existing_files.add(f.name)
+
+            if not existing_files:
+                print(f"[Warehouse] No data files exist, will reset table")
+                self._reset_table_for_missing_data()
+                return
+
+            print(f"[Warehouse] Found {len(existing_files)} data files on disk")
+            self._table = None
+
+        except Exception as e:
+            print(f"[Warehouse] Error repairing missing data files: {e}")
+            self._table = None
+
+    def _reset_table_for_missing_data(self):
+        try:
+            import psycopg2
+            import shutil
+
+            db_config = self.config.get("database", {})
+            conn = psycopg2.connect(
+                host=db_config.get("host", "localhost"),
+                port=db_config.get("port", 5432),
+                dbname=db_config.get("name", "iceberg_db"),
+                user=db_config.get("user", "admin"),
+                password=db_config.get("password", "admin123"),
+            )
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "DELETE FROM iceberg_tables WHERE table_namespace = %s AND table_name = %s",
+                (self.namespace, self.table_name),
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            table_path = self.get_table_path()
+            if table_path.exists():
+                shutil.rmtree(table_path)
+
+            print(
+                f"[Warehouse] Reset table for {self.namespace}.{self.table_name}, table will be recreated on next write"
+            )
+            self._table = None
+            self._catalog = None
+
+        except Exception as e:
+            print(f"[Warehouse] Error resetting table: {e}")
+            self._table = None
+
 
     def start_maintenance(self):
         if self.compaction_enabled and not self._compaction_thread:

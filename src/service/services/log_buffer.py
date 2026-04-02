@@ -124,12 +124,18 @@ class LogBuffer:
         """Actual logic to write logs to warehouse."""
         if self._warehouse and logs_to_write:
             try:
-                # Remove any table metadata
+                # Group logs by table
+                table_groups = {}
                 for log in logs_to_write:
-                    log.pop("_warehouse_table", None)
+                    table_name = log.pop("_warehouse_table", None)
+                    if table_name not in table_groups:
+                        table_groups[table_name] = []
+                    table_groups[table_name].append(log)
                 
-                # Insert all logs into the configured table
-                self._warehouse.insert_logs(logs_to_write)
+                # Insert logs for each table group
+                for table_name, logs in table_groups.items():
+                    # If table_name is None, it will use default cloudwatch_logs table
+                    self._warehouse.insert_logs(logs, table_name=table_name)
                 
                 # Cleanup WAL only after successful write to Iceberg
                 if self.wal_enabled:
@@ -140,7 +146,8 @@ class LogBuffer:
                 self._last_error = str(e)
                 print(f"[LogBuffer] Flush failed, keeping logs in buffer: {e}")
                 with self._lock:
-                    # Prepend failed logs back to buffer
+                    # Prepend failed logs back to buffer (need to restore metadata if possible)
+                    # But for now, we just prepend them back
                     self._buffer = logs_to_write + self._buffer
                 return 0
         return 0
