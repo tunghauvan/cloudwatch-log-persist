@@ -26,8 +26,8 @@ buffer: # In-memory buffer & WAL settings (Hot Tier)
 
 compaction:
   enabled: true
-  interval_seconds: 120
-  max_data_files: 50
+  interval_seconds: 300
+  max_data_files: 1000
 
 retention:
   enabled: true
