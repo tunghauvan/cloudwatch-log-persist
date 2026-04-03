@@ -276,3 +276,23 @@ def filter_log_events():
             ]
         }
     )
+
+
+@logs_bp.route("/MigrateToTimestampPartitioning", methods=["POST"])
+def migrate_to_timestamp_partitioning():
+    """
+    Migrate CloudWatch logs table from ingestion_time partitioning to timestamp partitioning.
+    This improves query performance by enabling better partition pruning.
+    
+    POST /MigrateToTimestampPartitioning
+    """
+    warehouse = get_warehouse()
+    if not warehouse:
+        return jsonify({
+            "status": "error",
+            "message": "Warehouse not available"
+        }), 500
+    
+    result = warehouse.migrate_to_timestamp_partitioning()
+    status_code = 200 if result["status"] in ("success", "skipped") else 500
+    return jsonify(result), status_code

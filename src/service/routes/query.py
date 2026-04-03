@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from flask import Blueprint, request, jsonify
 import time
 import re
+from datetime import datetime, timezone
 from service.services.log_store import log_store
 from service.routes.query_parser import parse_query
 
@@ -134,10 +135,13 @@ def _execute_query(execution: QueryExecution):
         try:
             where_parts = [f"log_group_name == '{execution.log_group_name}'"]
 
+            # Use ISO datetime strings so PyIceberg can prune partitions correctly
             if execution.start_time:
-                where_parts.append(f"timestamp >= {execution.start_time * 1000000}")
+                ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
+                where_parts.append(f"timestamp >= '{ts_start.isoformat()}'")
             if execution.end_time:
-                where_parts.append(f"timestamp <= {execution.end_time * 1000000}")
+                ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
+                where_parts.append(f"timestamp <= '{ts_end.isoformat()}'")
 
             filter_expr = " AND ".join(where_parts)
             print(f"[Query] filter_expr: {filter_expr}")
@@ -149,14 +153,24 @@ def _execute_query(execution: QueryExecution):
             )
             if limit < 1:
                 limit = 1000
-            result = warehouse.query(filter_expr=filter_expr, limit=limit * 10)
 
-            events = []
-            for i in range(result.num_rows):
-                row = {
-                    col: result.column(col)[i].as_py() for col in result.column_names
-                }
-                events.append(row)
+            # Fetch only what we need; add headroom only when CWL filters will discard rows
+            cwl_filters = (
+                execution.parsed_query["filters"]
+                if execution.parsed_query and execution.parsed_query["filters"]
+                else []
+            )
+            fetch_limit = limit * 3 if cwl_filters else limit
+            result = warehouse.query(filter_expr=filter_expr, limit=fetch_limit)
+
+            # Batch-convert Arrow table to Python dicts (vectorised, not row-by-row)
+            rows_dict = result.to_pydict()
+            num_rows = result.num_rows
+            col_names = result.column_names
+            events = [
+                {col: rows_dict[col][i] for col in col_names}
+                for i in range(num_rows)
+            ]
             print(f"[Query] Warehouse returned {len(events)} events before CWL filter")
 
             if execution.parsed_query and execution.parsed_query["filters"]:

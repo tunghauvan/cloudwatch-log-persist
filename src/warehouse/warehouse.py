@@ -245,6 +245,7 @@ class WarehouseManager:
         return Schema(*fields)
 
     def _get_partition_spec(self) -> PartitionSpec:
+        """Partition spec on ingestion_time (field 5) — legacy for backward compat."""
         return PartitionSpec(
             PartitionField(
                 source_id=5,
@@ -253,6 +254,130 @@ class WarehouseManager:
                 transform=DayTransform(),
             )
         )
+
+    def _get_partition_spec_v2(self) -> PartitionSpec:
+        """Optimized partition spec on timestamp (field 3) for better partition pruning."""
+        return PartitionSpec(
+            PartitionField(
+                source_id=3,
+                field_id=100,
+                name="event_day",
+                transform=DayTransform(),
+            )
+        )
+
+    def migrate_to_timestamp_partitioning(self, table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Migrate table from ingestion_time partitioning to timestamp partitioning.
+        This improves query performance because PyIceberg can prune partitions based on timestamp filters.
+        
+        Process:
+        1. Create temp table with new partition spec (source_id=3 for timestamp)
+        2. Scan all data from original table → insert into temp table
+        3. Drop original table
+        4. Rename temp table to original name
+        
+        Returns migration status dict.
+        """
+        if not PYICEBERG_AVAILABLE:
+            return {"status": "skipped", "reason": "PyIceberg not available"}
+
+        target_table = table_name or self.table_name
+        table_id = f"{self.namespace}.{target_table}"
+        temp_table_id = f"{self.namespace}.{target_table}_v2_migration"
+
+        logger.info(f"[Migration] Starting timestamp partitioning migration for {table_id}")
+
+        try:
+            # 1. Check if original table exists and is using old partition spec
+            orig_table = self.catalog.load_table(table_id)
+            orig_spec = orig_table.spec()
+            
+            # Check if already migrated (partition field source_id = 3 = timestamp)
+            for pf in orig_spec.fields:
+                if pf.source_id == 3:  # timestamp
+                    logger.info(f"[Migration] Table {table_id} already using timestamp partitioning")
+                    return {"status": "skipped", "reason": "already_migrated"}
+
+            logger.info(f"[Migration] Original table has {orig_table.scan().to_arrow().num_rows} rows")
+
+            # 2. Create temp table with new partition spec
+            try:
+                self.catalog.load_table(temp_table_id)
+                logger.warning(f"[Migration] Temp table {temp_table_id} exists, dropping it first")
+                self.catalog.drop_table(temp_table_id)
+            except Exception:
+                pass  # Doesn't exist yet
+            
+            temp_table = self.catalog.create_table(
+                temp_table_id,
+                schema=self._get_schema(),
+                partition_spec=self._get_partition_spec_v2(),
+            )
+            logger.info(f"[Migration] Created temp table {temp_table_id} with timestamp partitioning")
+
+            # 3. Copy data: scan original → insert into temp
+            orig_data = orig_table.scan().to_arrow()
+            if orig_data.num_rows > 0:
+                temp_table.append(orig_data)
+                logger.info(f"[Migration] Copied {orig_data.num_rows} rows to temp table")
+            else:
+                logger.info(f"[Migration] Original table is empty")
+
+            # 4. Drop original and rename temp
+            self.catalog.drop_table(table_id)
+            logger.info(f"[Migration] Dropped original table {table_id}")
+            
+            # Rename via SQL if available, otherwise drop+recreate with data
+            try:
+                # PyIceberg doesn't have rename_table, so we manually do drop+recreate
+                # Get temp table location
+                temp_location = temp_table.location()
+                
+                # Create new table with original name at temp location
+                # Actually, we can't just move files. Let's do it properly:
+                # Drop temp, recreate original with new spec, copy data back
+                self.catalog.drop_table(temp_table_id)
+                
+                # Recreate original table with new partition spec
+                new_table = self.catalog.create_table(
+                    table_id,
+                    schema=self._get_schema(),
+                    partition_spec=self._get_partition_spec_v2(),
+                )
+                logger.info(f"[Migration] Recreated {table_id} with timestamp partitioning")
+                
+                # Re-insert data into new table
+                if orig_data.num_rows > 0:
+                    new_table.append(orig_data)
+                    logger.info(f"[Migration] Re-inserted {orig_data.num_rows} rows into migrated table")
+                
+            except Exception as rename_err:
+                logger.error(f"[Migration] Rename/recreate failed: {rename_err}")
+                # Cleanup: drop temp table if it still exists
+                try:
+                    self.catalog.drop_table(temp_table_id)
+                except Exception:
+                    pass
+                raise
+
+            # 5. Verify migration
+            migrated_table = self.catalog.load_table(table_id)
+            migrated_spec = migrated_table.spec()
+            logger.info(f"[Migration] Migration complete. New spec: {migrated_spec}")
+
+            return {
+                "status": "success",
+                "message": f"Migrated {table_id} to timestamp partitioning",
+                "rows_migrated": orig_data.num_rows if orig_data else 0,
+            }
+
+        except Exception as e:
+            logger.error(f"[Migration] Failed: {type(e).__name__}: {str(e)[:200]}")
+            return {
+                "status": "error",
+                "message": str(e),
+            }
 
     def ensure_warehouse(self):
         if not PYICEBERG_AVAILABLE:
@@ -479,13 +604,13 @@ class WarehouseManager:
             scan = table_obj.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
-            
-            result = scan.to_arrow()
-            
-            # Apply limit after loading (PyIceberg doesn't support scan.limit())
-            if limit and limit > 0 and len(result) > limit:
-                result = result.slice(0, limit)
-                
+
+            # Use batch reader for early stop — avoids downloading all S3 files into RAM
+            if limit and limit > 0:
+                result = self._scan_to_arrow_with_limit(scan, limit)
+            else:
+                result = scan.to_arrow()
+
             logs_returned = len(result)
             print(
                 f"Query returned {logs_returned} rows from {target_table_name}"
@@ -670,160 +795,102 @@ class WarehouseManager:
 
     def compact(self, table_name: Optional[str] = None):
         """
-        Aggressive compaction that consolidates ALL parquet files in the warehouse.
-        Processes all partitions and consolidates remaining files without threshold checks.
-        
+        Compact Iceberg table using the proper transaction API: scan → overwrite per partition.
+        This updates the Iceberg manifest so queries benefit from fewer, larger files.
+
         Args:
-            table_name: Optional table name to compact. Defaults to self.table_name (cloudwatch_logs)
+            table_name: Optional table name to compact. Defaults to self.table_name.
         """
         if not self.compaction_enabled:
             return {"status": "skipped", "reason": "Compaction is disabled in config"}
 
-        # Use provided table_name or default to self.table_name
         target_table = table_name or self.table_name
+        table_id = f"{self.namespace}.{target_table}"
 
         try:
             warehouse_metrics.record_compaction()
-            
-            table_id = f"{self.namespace}.{target_table}"
-            logger.info(f"[Compaction] Starting aggressive compaction for {table_id}")
-            
-            import boto3
-            from datetime import datetime
-            import pyarrow.parquet as pq
             import pyarrow as pa
-            import io
-            
-            # S3 configuration
-            s3_config = self.config.get("s3", {})
-            endpoint_url = s3_config.get("endpoint", "http://localhost:9000")
-            access_key = s3_config.get("access_key", "admin")
-            secret_key = s3_config.get("secret_key", "admin123")
-            bucket = "warehouse"
-            
-            # Create S3 client
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=endpoint_url,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                region_name="us-east-1"
-            )
-            
-            # Get base path
-            data_prefix = f"{self.namespace}/{target_table}/data"
-            logger.info(f"[Compaction] Scanning s3://{bucket}/{data_prefix}")
-            
-            # List ALL parquet files in the data directory
-            response = s3.list_objects_v2(Bucket=bucket, Prefix=data_prefix)
-            
-            if "Contents" not in response:
-                logger.info(f"[Compaction] No files found")
-                return {"status": "skipped", "reason": "no_files"}
-            
-            all_files = [obj["Key"] for obj in response["Contents"]]
-            regular_parquets = [f for f in all_files if f.endswith(".parquet") and "consolidated" not in f]
-            
-            logger.info(f"[Compaction] Found {len(regular_parquets)} fragmented parquet files to consolidate")
-            
-            if not regular_parquets:
-                return {"status": "success", "message": "No fragmented files to consolidate"}
-            
-            # Group files by partition
-            from collections import defaultdict
-            partitions = defaultdict(list)
-            
-            for file_key in regular_parquets:
-                # Extract partition path
-                if "ingestion_day=" in file_key:
-                    partition_part = file_key.split("ingestion_day=")[1].split("/")[0]
-                else:
-                    partition_part = "unpartitioned"
-                partitions[partition_part].append(file_key)
-            
-            logger.info(f"[Compaction] Files distributed across {len(partitions)} partitions")
-            
-            # Consolidate each partition
-            total_consolidated = 0
-            total_deleted = 0
-            batch_size = 10
-            
-            for partition_name, partition_files in partitions.items():
-                logger.info(f"[Compaction] Processing partition '{partition_name}' with {len(partition_files)} files")
-                
-                # Process files in batches
-                for batch_start in range(0, len(partition_files), batch_size):
-                    batch_files = partition_files[batch_start:batch_start + batch_size]
-                    tables = []
-                    row_count = 0
-                    
-                    for file_key in batch_files:
-                        try:
-                            obj = s3.get_object(Bucket=bucket, Key=file_key)
-                            file_content = obj["Body"].read()
-                            parquet_file = pq.read_table(io.BytesIO(file_content))
-                            tables.append(parquet_file)
-                            row_count += parquet_file.num_rows
-                            logger.debug(f"[Compaction] Read {file_key} ({parquet_file.num_rows} rows)")
-                        except Exception as e:
-                            logger.warning(f"[Compaction] Could not read {file_key}: {e}")
-                    
-                    if not tables:
-                        continue
-                    
-                    # Consolidate batch
-                    combined_table = pa.concat_tables(tables)
-                    
-                    # Use the partition prefix for consolidated file
-                    if "ingestion_day=" in batch_files[0]:
-                        partition_prefix = batch_files[0].rsplit("/", 1)[0]
-                    else:
-                        partition_prefix = f"{data_prefix}/ingestion_day={partition_name}"
-                    
-                    timestamp_str = datetime.now().isoformat().replace(':', '-')
-                    batch_num = batch_start // batch_size + 1
-                    consolidated_key = f"{partition_prefix}/consolidated_{timestamp_str}_batch{batch_num}.parquet"
-                    
-                    buf = io.BytesIO()
-                    pq.write_table(combined_table, buf)
-                    buf.seek(0)
-                    
-                    s3.put_object(Bucket=bucket, Key=consolidated_key, Body=buf.getvalue())
-                    logger.info(f"[Compaction] Partition '{partition_name}': Consolidated {len(tables)} files → {consolidated_key}")
-                    total_consolidated += len(tables)
-                    
-                    # NOTE: We keep the original files to avoid breaking Iceberg manifest references.
-                    # Old files will be cleaned up by retention policies.
-                    # Mark them with a marker to identify as "pre-consolidated" for future cleanup
-                    # total_deleted += 1
-            
-            logger.info(f"[Compaction] Complete: Consolidated {total_consolidated} files, deleted {total_deleted} files")
-            
-            # Force metadata refresh by reloading the table
-            # This ensures Iceberg scans the new consolidated files
-            try:
-                table_id = f"{self.namespace}.{target_table}"
-                table_obj = self.catalog.load_table(table_id)
-                logger.info(f"[Compaction] Metadata refreshed for {table_id}")
-            except Exception as refresh_err:
-                logger.warning(f"[Compaction] Could not refresh metadata: {refresh_err}")
-            
+
+            table_obj = self.catalog.load_table(table_id)
+            logger.info(f"[Compaction] Starting Iceberg-native compaction for {table_id}")
+
+            # Inspect current snapshot to count data files
+            current_snapshot = table_obj.current_snapshot()
+            if current_snapshot is None:
+                return {"status": "skipped", "reason": "no_snapshot"}
+
+            manifests = current_snapshot.manifests(table_obj.io)
+            data_file_count = sum(m.existing_files_count + m.added_files_count for m in manifests)
+            logger.info(f"[Compaction] Current snapshot has ~{data_file_count} data file entries across {len(manifests)} manifests")
+
+            if data_file_count <= 1:
+                return {"status": "skipped", "reason": "already_compact", "files": data_file_count}
+
+            # Collect partition days present in this table using metadata
+            partition_days = set()
+            for manifest in manifests:
+                for entry in manifest.fetch_manifest_entry(table_obj.io):
+                    if entry.data_file.partition:
+                        part_val = entry.data_file.partition.get(0)  # ingestion_day
+                        if part_val is not None:
+                            partition_days.add(int(part_val))
+
+            logger.info(f"[Compaction] Found {len(partition_days)} unique partitions to compact")
+
+            total_rows_compacted = 0
+            partitions_done = 0
+
+            if partition_days:
+                # Per-partition compaction: avoids loading all data into RAM at once
+                from pyiceberg.expressions import EqualTo
+
+                for day_val in sorted(partition_days):
+                    try:
+                        # Scan only this partition
+                        day_scan = table_obj.scan().filter(
+                            f"ingestion_time >= '{datetime.fromtimestamp(day_val * 86400, tz=timezone.utc).replace(tzinfo=None).isoformat()}'"
+                            + f" AND ingestion_time < '{datetime.fromtimestamp((day_val + 1) * 86400, tz=timezone.utc).replace(tzinfo=None).isoformat()}'"
+                        )
+                        partition_data = day_scan.to_arrow()
+                        if partition_data.num_rows == 0:
+                            continue
+
+                        # Overwrite just this partition's data (creates new compacted file,
+                        # marks old fragmented files as deleted in Iceberg metadata)
+                        table_obj.overwrite(
+                            partition_data,
+                            overwrite_filter=(
+                                f"ingestion_time >= '{datetime.fromtimestamp(day_val * 86400, tz=timezone.utc).replace(tzinfo=None).isoformat()}'"
+                                + f" AND ingestion_time < '{datetime.fromtimestamp((day_val + 1) * 86400, tz=timezone.utc).replace(tzinfo=None).isoformat()}'"
+                            ),
+                        )
+                        total_rows_compacted += partition_data.num_rows
+                        partitions_done += 1
+                        logger.info(f"[Compaction] Partition day={day_val}: compacted {partition_data.num_rows} rows")
+                    except Exception as part_err:
+                        logger.warning(f"[Compaction] Partition day={day_val} failed: {part_err}")
+            else:
+                # No partition info — compact whole table at once (fallback)
+                logger.info("[Compaction] No partition info found, compacting full table")
+                all_data = table_obj.scan().to_arrow()
+                if all_data.num_rows > 0:
+                    table_obj.overwrite(all_data)
+                    total_rows_compacted = all_data.num_rows
+                    partitions_done = 1
+
+            logger.info(f"[Compaction] Done: {total_rows_compacted} rows across {partitions_done} partitions")
             return {
                 "status": "success",
-                "message": f"Consolidated {total_consolidated} fragmented files across {len(partitions)} partitions",
-                "files_consolidated": total_consolidated,
-                "files_deleted": total_deleted,
-                "partitions_processed": len(partitions)
+                "message": f"Iceberg-native compaction: {total_rows_compacted} rows, {partitions_done} partitions",
+                "rows_compacted": total_rows_compacted,
+                "partitions_processed": partitions_done,
             }
-                
+
         except Exception as e:
-            err_msg = str(e).lower()
-            logger.error(f"[Compaction] Error: {type(e).__name__}: {str(e)[:100]}")
-            
-            # Graceful fallback
+            logger.error(f"[Compaction] Error: {type(e).__name__}: {str(e)[:200]}")
             return {
-                "status": "success",
-                "message": f"Table operational (compaction attempted: {type(e).__name__})"
+                "status": "error",
+                "message": f"{type(e).__name__}: {str(e)[:200]}",
             }
 
 
