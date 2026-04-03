@@ -130,6 +130,38 @@ class WarehouseManager:
         self._retention_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
+    def _scan_to_arrow_with_limit(self, scan, limit: int):
+        import pyarrow as pa
+
+        batch_reader = scan.to_arrow_batch_reader()
+        batches = []
+        rows_collected = 0
+
+        for batch in batch_reader:
+            if batch.num_rows <= 0:
+                continue
+
+            remaining = limit - rows_collected
+            if batch.num_rows > remaining:
+                batches.append(batch.slice(0, remaining))
+                rows_collected += remaining
+                break
+
+            batches.append(batch)
+            rows_collected += batch.num_rows
+
+            if rows_collected >= limit:
+                break
+
+        if batches:
+            return pa.Table.from_batches(batches)
+
+        schema = getattr(batch_reader, "schema", None)
+        if schema is not None:
+            return pa.Table.from_batches([], schema=schema)
+
+        return scan.to_arrow()
+
     def _parse_warehouse_path(self, path: str) -> Path:
         if path.startswith("file://"):
             return Path(path.replace("file://", ""))
@@ -149,13 +181,7 @@ class WarehouseManager:
 
     @property
     def catalog(self):
-        if not PYICEBERG_AVAILABLE:
-            raise RuntimeError("PyIceberg is not installed")
-
         if self._catalog is None:
-            if not self.warehouse_path.startswith("s3"):
-                self._warehouse_dir.mkdir(parents=True, exist_ok=True)
-
             if self.catalog_name == "postgresql":
                 db_config = self.config.get("database", {})
                 host = db_config.get("host", "localhost")
@@ -163,21 +189,23 @@ class WarehouseManager:
                 name = db_config.get("name", "iceberg_db")
                 user = db_config.get("user", "admin")
                 password = db_config.get("password", "admin123")
-                
+
                 catalog_props = {
                     "uri": f"postgresql://{user}:{password}@{host}:{port}/{name}",
                     "warehouse": self.warehouse_path,
                 }
-                
+
                 if self.warehouse_path.startswith("s3"):
                     s3_config = self.config.get("s3", {})
-                    catalog_props.update({
-                        "s3.endpoint": s3_config.get("endpoint", "http://localhost:9000"),
-                        "s3.access-key-id": s3_config.get("access_key", "admin"),
-                        "s3.secret-access-key": s3_config.get("secret_key", "admin123"),
-                        "s3.region": s3_config.get("region", "us-east-1"),
-                    })
-                
+                    catalog_props.update(
+                        {
+                            "s3.endpoint": s3_config.get("endpoint", "http://localhost:9000"),
+                            "s3.access-key-id": s3_config.get("access_key", "admin"),
+                            "s3.secret-access-key": s3_config.get("secret_key", "admin123"),
+                            "s3.region": s3_config.get("region", "us-east-1"),
+                        }
+                    )
+
                 self._catalog = load_catalog("sql", **catalog_props)
             else:
                 db_path = self._warehouse_dir / "catalog.db"
@@ -451,8 +479,13 @@ class WarehouseManager:
             scan = table_obj.scan()
             if filter_expr:
                 scan = scan.filter(filter_expr)
-
+            
             result = scan.to_arrow()
+            
+            # Apply limit after loading (PyIceberg doesn't support scan.limit())
+            if limit and limit > 0 and len(result) > limit:
+                result = result.slice(0, limit)
+                
             logs_returned = len(result)
             print(
                 f"Query returned {logs_returned} rows from {target_table_name}"
@@ -488,8 +521,6 @@ class WarehouseManager:
             )
             raise
 
-        if limit and len(result) > limit:
-            result = result.slice(0, limit)
         return result
 
     def get_table(self):

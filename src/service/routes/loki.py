@@ -52,7 +52,7 @@ def parse_logql_filter(filter_expr):
             if "=~" in label:
                 key, value = label.split("=~", 1)
                 key = key.strip()
-                value = value.strip().strip('"').strip("`")
+                value = value.strip().strip('"').strip("`").strip("'")
                 # For regex match .+ (match any), track it for grouping but don't filter
                 if value == ".+" or value == ".*":
                     regex_label = key  # Track this label for grouping
@@ -66,7 +66,7 @@ def parse_logql_filter(filter_expr):
             elif "=" in label:
                 key, value = label.split("=", 1)
                 key = key.strip()
-                value = value.strip().strip('"').strip("`")
+                value = value.strip().strip('"').strip("`").strip("'")
                 if key == "log_group" or key == "log_group_name":
                     log_group = value
                 elif key == "log_stream" or key == "log_stream_name":
@@ -74,14 +74,69 @@ def parse_logql_filter(filter_expr):
                 else:
                     labels_filter[key] = value
 
-    if "|=" in filter_expr:
-        parts = filter_expr.split("|=")
-        if len(parts) > 1:
-            message_filter = parts[-1].strip().strip('"').strip("`")
-    elif "|~" in filter_expr:
-        parts = filter_expr.split("|~")
-        if len(parts) > 1:
-            message_filter = parts[-1].strip().strip('"').strip("`")
+    # Parse label filters after pipe operators (e.g., | detected_level="info")
+    # Note: detected_level is extracted from message, not a stored label
+    detected_levels = []  # Track multiple detected_level values for OR logic
+    if "|" in filter_expr:
+        # Get the part after the bracket group
+        after_bracket = filter_expr
+        if "}" in filter_expr:
+            after_bracket = filter_expr.split("}", 1)[1]
+        
+        # Handle detected_level with OR logic (extract all detected_level filters)
+        if "detected_level" in after_bracket:
+            import re as regex
+            # Match: detected_level = "warn" or detected_level = "info", etc.
+            level_pattern = r'detected_level\s*=\s*["\'](\w+)["\']'
+            for match in regex.finditer(level_pattern, after_bracket):
+                detected_levels.append(match.group(1).lower())
+            
+            # Set message_filter with comma-separated levels for OR logic
+            if detected_levels:
+                message_filter = f"level:{','.join(detected_levels)}"
+        
+        # Split by pipes and look for label filters
+        segments = after_bracket.split("|")
+        for segment in segments:
+            segment = segment.strip()
+            # Skip parser directives (json, logfmt, drop, etc)
+            if any(directive in segment for directive in ["json", "logfmt", "drop", "unwrap", "pattern"]):
+                continue
+            
+            # Skip detected_level (already handled above with OR logic)
+            if "detected_level" in segment:
+                continue
+            
+            # Check for other label filters with = or =~
+            if "=~" in segment:
+                key, value = segment.split("=~", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("`").strip("'")
+                if value and value not in (".+", ".*"):
+                    labels_filter[key] = value
+            elif "=" in segment and not any(x in segment for x in ["!=", "<=", ">="]):
+                key, value = segment.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("`").strip("'")
+                # Only add if it looks like a label filter, not content like "error"
+                if key and value and " " not in key:
+                    labels_filter[key] = value
+            # Handle |= and |~ for message filters
+            elif segment and ("!=" not in segment):
+                # This is a message filter if it doesn't look like a label filter
+                if "=" not in segment:
+                    message_filter = segment.strip('"').strip("`")
+
+    # Fallback: if we still haven't found message filter via pipes
+    if not message_filter:
+        if "|=" in filter_expr:
+            parts = filter_expr.split("|=")
+            if len(parts) > 1:
+                message_filter = parts[-1].strip().strip('"').strip("`")
+        elif "|~" in filter_expr:
+            parts = filter_expr.split("|~")
+            if len(parts) > 1:
+                message_filter = parts[-1].strip().strip('"').strip("`")
 
     return log_group, log_stream, message_filter, labels_filter, regex_label
 
@@ -612,14 +667,19 @@ def loki_query_range():
             mapped_key = {"service_name": "service"}.get(k, k)
             warehousing_labels[mapped_key] = v
 
-        # Remove fetch limit as requested to ensure all logs in range are processed
+        # Fetch only as many rows as we need for regular log queries.
+        # Metric queries still read the full range later in this handler.
+        fetch_limit = None if is_metric_query(query) else limit
+        if message_filter and fetch_limit is not None:
+            fetch_limit = max(fetch_limit * 10, 1000)
+
         events = warehouse.get_logs(
             table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time=start,
             end_time=end,
-            limit=None,  # No limit, fetch all logs in the time range
+            limit=fetch_limit,
             labels_filter=warehousing_labels,
         )
         logger.debug(f" Warehouse returned {len(events)} events")
@@ -629,14 +689,39 @@ def loki_query_range():
 
     # Since warehouse now does the filtering correctly with labels_filter, 
     # we can skip the manual loop unless there are additional filter types (like message filter)
+    filtered_events = events
+    
     if message_filter:
         filtered_events = []
-        msg_filter_lower = message_filter.lower()
-        for e in events:
-            if msg_filter_lower in e.get("message", "").lower():
-                filtered_events.append(e)
-    else:
-        filtered_events = events
+        # Handle detected_level filters (pseudo message filters with level: prefix)
+        if message_filter.startswith("level:"):
+            target_levels_str = message_filter[6:]  # Extract level names (comma-separated for OR)
+            target_levels = [l.strip() for l in target_levels_str.split(",")]
+            
+            # Map level names to keywords
+            level_keywords = {
+                "error": ["error"],
+                "warn": ["warn", "warning"],
+                "info": ["info", "information"],
+                "debug": ["debug"],
+            }
+            
+            # Collect all keywords for the target levels (OR logic)
+            all_keywords = []
+            for level in target_levels:
+                all_keywords.extend(level_keywords.get(level, []))
+            
+            for e in events:
+                msg = e.get("message", "").lower()
+                # Match if ANY keyword is found (OR logic)
+                if any(kw in msg for kw in all_keywords):
+                    filtered_events.append(e)
+        else:
+            # Regular message filter
+            msg_filter_lower = message_filter.lower()
+            for e in events:
+                if msg_filter_lower in e.get("message", "").lower():
+                    filtered_events.append(e)
 
     logger.debug(f" Filtering done. {len(filtered_events)} events matched.")
     
