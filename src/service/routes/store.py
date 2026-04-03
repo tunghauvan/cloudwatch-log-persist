@@ -46,3 +46,16 @@ def trigger_retention():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@store_bp.route("/warehouse/cleanup-metadata", methods=["POST"])
+def trigger_cleanup_metadata():
+    try:
+        from service.server import warehouse
+
+        if not warehouse:
+            return jsonify({"error": "Warehouse not initialized"}), 500
+        result = warehouse.cleanup_metadata()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

@@ -141,14 +141,14 @@ def get_warehouse():
 
 
 def describe_log_groups():
-    wh = get_warehouse()
-    if wh:
-        groups = wh.get_log_groups()
-        return jsonify({"logGroups": list(groups.values())})
-    return jsonify({"logGroups": []})
+    from service.services.log_store import log_store
+    groups = log_store.get_all_log_groups()
+    return jsonify({"logGroups": list(groups.values())})
 
 
 def describe_log_streams():
+    from service.services.log_store import log_store
+    
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         log_group_name = data.get("logGroupName")
@@ -160,11 +160,8 @@ def describe_log_streams():
             {"__type": "InvalidParameterException", "message": "Missing logGroupName"}
         ), 400
 
-    wh = get_warehouse()
-    if wh:
-        streams = wh.get_log_streams(log_group_name)
-        return jsonify({"logStreams": streams})
-    return jsonify({"logStreams": []})
+    streams = log_store.get_log_streams(log_group_name)
+    return jsonify({"logStreams": streams})
 
 
 def put_log_events():
@@ -234,6 +231,8 @@ def put_log_events():
 
 
 def get_log_events():
+    from service.services.log_store import log_store
+    
     if request.method == "POST":
         data = request.get_json(force=True)
         log_group_name = data.get("logGroupName")
@@ -263,17 +262,13 @@ def get_log_events():
             }
         ), 400
 
-    wh = get_warehouse()
-    if wh:
-        events = wh.get_logs(
-            log_group_name=log_group_name,
-            log_stream_name=log_stream_name,
-            start_time=start_time,
-            end_time=end_time,
-            limit=limit,
-        )
-    else:
-        events = []
+    events = log_store.get_events(
+        log_group_name=log_group_name,
+        log_stream_name=log_stream_name,
+        start_time=start_time,
+        end_time=end_time,
+        limit=limit,
+    )
 
     return jsonify(
         {
@@ -292,6 +287,8 @@ def get_log_events():
 
 
 def filter_log_events():
+    from service.services.log_store import log_store
+    
     data = request.get_json(force=True) or {}
     log_group_name = data.get("logGroupName")
     log_stream_name_prefix = data.get("logStreamNamePrefix")
@@ -313,21 +310,14 @@ def filter_log_events():
             }
         ), 400
 
-    wh = get_warehouse()
-    if wh:
-        events = wh.get_logs(
-            log_group_name=log_group_name,
-            start_time=start_time,
-            end_time=end_time,
-            limit=limit,
-        )
-    else:
-        events = []
-
-    if filter_pattern:
-        events = [
-            e for e in events if filter_pattern.lower() in e.get("message", "").lower()
-        ]
+    events = log_store.filter_events(
+        log_group_name=log_group_name,
+        log_stream_name_prefix=log_stream_name_prefix,
+        filter_pattern=filter_pattern,
+        start_time=start_time,
+        end_time=end_time,
+        limit=limit,
+    )
 
     return jsonify(
         {
@@ -381,6 +371,11 @@ def get_query_execution_results():
 def flush_buffer():
     if log_buffer:
         count = log_buffer.flush()
+        # Wait for flush queue to be empty (with timeout)
+        try:
+            log_buffer._flush_queue.join()
+        except Exception:
+            pass
         return jsonify({"status": "ok", "flushed": count})
     return jsonify({"status": "ok", "flushed": 0})
 

@@ -17,16 +17,16 @@ spark:
   app_name: CloudWatchLogPersist
   master: local[*]
 
-buffer: # In-memory buffer & WAL settings
-  max_size: 100
-  flush_interval_seconds: 10
-  worker_threads: 1
+buffer: # In-memory buffer & WAL settings (Hot Tier)
+  max_size: 50000        # Tăng max_size để chứa nhiều log hơn ở Hot Tier
+  flush_interval_seconds: 60  # Flush định kỳ 1 phút để giảm phân mảnh trên S3
+  worker_threads: 2
   wal_enabled: true
   wal_dir: wal/
 
 compaction:
   enabled: true
-  interval_seconds: 300
+  interval_seconds: 120
   max_data_files: 50
 
 retention:

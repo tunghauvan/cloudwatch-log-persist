@@ -106,7 +106,7 @@ def push_logs():
 
     # Generate 10 logs with timestamp spread to avoid clustering
     base_time_ns = int(time.time() * 1_000_000_000)
-    for i in range(10):
+    for i in range(1000):
         # Add random offset (0-200ms) to spread timestamps
         timestamp_offset_ns = int(random.uniform(0, 200_000_000))  # 200ms spread
         entry = generate_log_entry()

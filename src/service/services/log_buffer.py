@@ -35,6 +35,9 @@ class LogBuffer:
         self._warehouse = None
         self._last_error: Optional[str] = None
         self._current_wal_file: Optional[Path] = None
+        self._wal_file_handle = None
+        self._wal_lock = threading.Lock()
+        self._max_wal_size_mb = 10  # Rotate WAL after 10MB
 
         # Background worker pool for flushing
         self._flush_queue = queue.Queue()
@@ -47,30 +50,42 @@ class LogBuffer:
 
     def _get_active_wal_file(self) -> Path:
         """Get or create the current active WAL file for appending."""
-        if self._current_wal_file and self._current_wal_file.exists():
+        with self._wal_lock:
+            # Check if current handle needs rotation
+            if self._current_wal_file and self._current_wal_file.exists():
+                if self._current_wal_file.stat().st_size >= self._max_wal_size_mb * 1024 * 1024:
+                    if self._wal_file_handle:
+                        self._wal_file_handle.close()
+                        self._wal_file_handle = None
+                    # Rename to mark as ready for flush/archive
+                    self._current_wal_file.rename(self._current_wal_file.with_suffix(".wal.full"))
+                    self._current_wal_file = None
+
+            if self._current_wal_file is None:
+                wal_id = f"segment_{int(time.time() * 1000)}.wal"
+                self._current_wal_file = self.wal_dir / wal_id
+                self._wal_file_handle = open(self._current_wal_file, "a", buffering=1) # Line buffered
+            
             return self._current_wal_file
-        
-        wal_id = f"active_{int(time.time())}.wal"
-        self._current_wal_file = self.wal_dir / wal_id
-        return self._current_wal_file
 
     def _recover_wal(self):
         """Load pending logs from WAL files on startup."""
-        logger.info(f"Recovering WAL from {self.wal_dir}...")
-        wal_files = sorted(list(self.wal_dir.glob("*.wal")))
+        logger.info(f"Recovering WAL segments from {self.wal_dir}...")
+        # Recover both .wal and .wal.full files
+        wal_files = sorted(list(self.wal_dir.glob("*.wal*")))
         recovered_count = 0
         for wal_file in wal_files:
+            if ".pending" in wal_file.suffixes:
+                continue
             try:
                 with open(wal_file, "r") as f:
                     for line in f:
                         if line.strip():
                             self._buffer.append(json.loads(line))
                             recovered_count += 1
-                # We don't delete yet, flush will handle cleanup if successful
-                # Or we can rename them to .recovered to avoid double recovery if crash during recovery
                 wal_file.rename(wal_file.with_suffix(".wal.pending"))
             except Exception as e:
-                logger.error(f"Failed to recover WAL file {wal_file}: {e}")
+                logger.error(f"Failed to recover WAL segment {wal_file}: {e}")
         
         if recovered_count > 0:
             logger.info(f"Recovered {recovered_count} logs from WAL.")
@@ -154,16 +169,18 @@ class LogBuffer:
         return 0
 
     def _write_to_wal(self, logs: List[Dict[str, Any]]):
-        """Write logs to the active WAL file."""
+        """Write logs to the active WAL segment with persistent handle."""
         if not self.wal_enabled:
             return None
             
         try:
-            wal_file = self._get_active_wal_file()
-            with open(wal_file, "a") as f:
-                for log in logs:
-                    f.write(json.dumps(log) + "\n")
-            return wal_file
+            self._get_active_wal_file() # Ensure handle is open
+            with self._wal_lock:
+                if self._wal_file_handle:
+                    for log in logs:
+                        self._wal_file_handle.write(json.dumps(log) + "\n")
+                    self._wal_file_handle.flush() # Ensure it's on disk
+            return self._current_wal_file
         except Exception as e:
             logger.error(f"WAL Write Error: {e}")
             return None
@@ -191,20 +208,21 @@ class LogBuffer:
         return len(logs_to_write)
 
     def _cleanup_wal(self):
-        """Remove processed WAL files and reset active file."""
-        try:
-            # First, check files that were pending or older
-            for wal_file in self.wal_dir.glob("*.wal*"):
-                if self._current_wal_file and wal_file == self._current_wal_file:
-                    continue # Keep appending to the current active file until flush
-                wal_file.unlink()
-            
-            # If we just flushed everything, we can safely rotate the current active file
-            if self._current_wal_file and self._current_wal_file.exists():
-                 self._current_wal_file.unlink()
-                 self._current_wal_file = None # Will create a new one on next add
-        except Exception as e:
-            print(f"[LogBuffer] WAL Cleanup Error: {e}")
+        """Remove processed WAL segments."""
+        with self._wal_lock:
+            try:
+                # Cleanup .pending and .full segments that are done
+                for wal_file in self.wal_dir.glob("*.wal*"):
+                    # NEVER delete the currently active file handle's file
+                    if self._current_wal_file and wal_file == self._current_wal_file:
+                        continue
+                    
+                    try:
+                        wal_file.unlink()
+                    except OSError:
+                        pass # Might be open by another process
+            except Exception as e:
+                print(f"[LogBuffer] WAL Cleanup Error: {e}")
 
     def _flush_loop(self):
         while not self._stop_event.is_set():
@@ -219,6 +237,65 @@ class LogBuffer:
     def size(self) -> int:
         with self._lock:
             return len(self._buffer)
+
+    def get_logs(
+        self,
+        log_group_name: str,
+        log_stream_name: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Search logs in the current hot tier (memory buffer)."""
+        with self._lock:
+            results = []
+            for log in self._buffer:
+                # Cần xử lý data mapping tương ứng với metadata format
+                if log.get("log_group_name") != log_group_name:
+                    continue
+                
+                if log_stream_name and log.get("log_stream_name") != log_stream_name:
+                    continue
+                
+                ts = log.get("timestamp")
+                if start_time and ts < start_time:
+                    continue
+                if end_time and ts > end_time:
+                    continue
+                
+                results.append(log)
+                
+            results.sort(key=lambda x: x.get("timestamp", 0))
+            return results[:limit]
+
+    def get_log_groups(self) -> Dict[str, Dict[str, Any]]:
+        """Get distinct log groups from buffer and their metadata."""
+        with self._lock:
+            groups = {}
+            for log in self._buffer:
+                group_name = log.get("log_group_name")
+                if group_name and group_name not in groups:
+                    groups[group_name] = {
+                        "logGroupName": group_name,
+                        "creationTime": log.get("ingestion_time", 0),
+                        "storedBytes": 0,
+                    }
+            return groups
+
+    def get_log_streams(self, log_group_name: str) -> Dict[str, Dict[str, Any]]:
+        """Get distinct log streams for a specific group from buffer."""
+        with self._lock:
+            streams = {}
+            for log in self._buffer:
+                if log.get("log_group_name") == log_group_name:
+                    stream_name = log.get("log_stream_name")
+                    if stream_name and stream_name not in streams:
+                        streams[stream_name] = {
+                            "logStreamName": stream_name,
+                            "creationTime": log.get("ingestion_time", 0),
+                            "storedBytes": 0,
+                        }
+            return streams
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:

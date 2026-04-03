@@ -9,6 +9,16 @@ from service.services.log_store import log_store
 logs_bp = Blueprint("logs", __name__)
 
 
+def get_log_buffer():
+    from service.server import log_buffer
+    return log_buffer
+
+
+def get_warehouse():
+    from service.server import warehouse
+    return warehouse
+
+
 def get_request_params():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
@@ -68,6 +78,32 @@ def put_log_events():
     new_sequence = log_store.add_log_group(
         log_group_name, log_stream_name, log_events, ingestion_time
     )
+
+    # Add logs to log_buffer (Hot Tier)
+    import logging
+    logger = logging.getLogger("service.logs")
+    
+    try:
+        buffer = get_log_buffer()
+        logger.info(f"[PutLogEvents] Buffer obj: {buffer}")
+        if buffer:
+            events_to_buffer = []
+            for event in log_events:
+                events_to_buffer.append({
+                    "log_group_name": log_group_name,
+                    "log_stream_name": log_stream_name,
+                    "timestamp": event.get("timestamp"),
+                    "message": event.get("message"),
+                    "ingestion_time": ingestion_time,
+                    "sequence_token": new_sequence
+                })
+            buffer.add(events_to_buffer)
+            logger.info(f"[PutLogEvents] Added {len(events_to_buffer)} events to buffer, buffer size now: {buffer.size()}")
+        else:
+            logger.warning(f"[PutLogEvents] Buffer is None!")
+    except Exception as e:
+        logger.error(f"[PutLogEvents] Could not add to buffer: {e}", exc_info=True)
+
     next_token = str(new_sequence)
 
     return jsonify(
@@ -104,6 +140,21 @@ def get_log_events():
             }
         ), 400
 
+    buffer = get_log_buffer()
+    warehouse = get_warehouse()
+
+    # 1. Search in Hot Tier (memory buffer)
+    hot_events = []
+    if buffer:
+        hot_events = buffer.get_logs(
+            log_group_name=log_group_name,
+            log_stream_name=log_stream_name,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    # 2. Search in Cold Tier (S3/Iceberg)
     events = log_store.get_events(
         log_group_name=log_group_name,
         log_stream_name=log_stream_name,
@@ -111,15 +162,30 @@ def get_log_events():
         end_time=end_time,
         limit=limit,
     )
+    
+    # Merge & Sort
+    all_events = events + hot_events
+    # Remove duplicates if any (based on message and timestamp)
+    seen = set()
+    unique_events = []
+    for e in all_events:
+        # Create a unique key for the event
+        key = (e.get('timestamp'), e.get('message'), e.get('log_stream_name') or log_stream_name)
+        if key not in seen:
+            seen.add(key)
+            unique_events.append(e)
 
-    print(f"[Debug] Returning events. First event timestamp: {events[0]['timestamp'] if events else 'None'}")
+    unique_events.sort(key=lambda x: x.get("timestamp", 0))
+    events = unique_events[:limit]
+
+    print(f"[Debug] Returning events from Hot & Cold tier. Total: {len(events)} (Hot: {len(hot_events)}, Cold: {len(all_events)-len(hot_events)})")
     return jsonify(
         {
             "events": [
                 {
-                    "timestamp": int(e["timestamp"] / 1000) if "timestamp" in e else 0,
+                    "timestamp": int(e["timestamp"]) if "timestamp" in e else 0,
                     "message": e["message"],
-                    "ingestionTime": int(e["ingestionTime"] / 1000) if "ingestionTime" in e else 0,
+                    "ingestionTime": int(e.get("ingestionTime") or e.get("ingestion_time") or 0),
                 }
                 for e in events
             ],
@@ -152,6 +218,30 @@ def filter_log_events():
             }
         ), 400
 
+    from service.utils.helpers import parse_filter_pattern
+    
+    buffer = get_log_buffer()
+
+    hot_events = []
+    if buffer:
+        hot_events = buffer.get_logs(
+            log_group_name=log_group_name,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+    
+    # Filter hot events by stream prefix and pattern
+    filtered_hot = []
+    for e in hot_events:
+        if log_stream_name_prefix:
+            if not e.get("log_stream_name", "").startswith(log_stream_name_prefix):
+                continue
+        if filter_pattern:
+            if not parse_filter_pattern(filter_pattern, e.get("message", "")):
+                continue
+        filtered_hot.append(e)
+
     events = log_store.filter_events(
         log_group_name=log_group_name,
         log_stream_name_prefix=log_stream_name_prefix,
@@ -161,13 +251,26 @@ def filter_log_events():
         limit=limit,
     )
 
+    # Merge & Sort
+    all_events = events + filtered_hot
+    seen = set()
+    unique_events = []
+    for e in all_events:
+        key = (e.get('timestamp'), e.get('message'), e.get('log_stream_name') or e.get('_stream_name'))
+        if key not in seen:
+            seen.add(key)
+            unique_events.append(e)
+
+    unique_events.sort(key=lambda x: x.get("timestamp", 0))
+    events = unique_events[:limit]
+
     return jsonify(
         {
             "events": [
                 {
                     "timestamp": e["timestamp"],
                     "message": e["message"],
-                    "ingestionTime": e["ingestionTime"],
+                    "ingestionTime": e.get("ingestionTime") or e.get("ingestion_time") or 0,
                 }
                 for e in events
             ]
