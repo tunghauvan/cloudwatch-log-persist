@@ -5,12 +5,23 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-service:
-  type: ClusterIP
-  port: 4588
-
+# ---------------------------------------------------------------------------
+# PostgreSQL — single instance used as catalog for BOTH cold and archive tiers
+# ---------------------------------------------------------------------------
 postgres:
-  enabled: true
+  enabled: true                          # set to false to use external database
+
+  # External PostgreSQL — only used when enabled=false
+  external:
+    host: ""                             # e.g., pg.example.com
+    port: 5432
+    database: iceberg_db
+    username: admin
+    # Password: either set here or reference existingSecret below
+    password: ""
+    existingSecret: ""                   # name of Secret with key: password
+    existingSecretPasswordKey: password
+
   image:
     repository: postgres
     tag: "15"
@@ -18,11 +29,13 @@ postgres:
   auth:
     database: iceberg_db
     username: admin
+    # password read from secret: postgres-secret → POSTGRES_PASSWORD
+    existingSecret: ""          # leave empty to auto-create secret from auth.password
     password: admin123
   primary:
     persistence:
       enabled: true
-      size: 5Gi
+      size: 10Gi
       storageClass: ""
     resources:
       requests:
@@ -34,38 +47,40 @@ postgres:
     healthcheck:
       enabled: true
 
-cloudwatchService:
-  enabled: true
+# ---------------------------------------------------------------------------
+# MinIO — S3-compatible object store for archive Iceberg tier
+# ---------------------------------------------------------------------------
+minio:
+  enabled: true                          # set to false to use external S3
+
+  # External S3 — only used when enabled=false
+  external:
+    endpoint: ""                         # e.g., https://s3.amazonaws.com or https://nyc3.digitaloceanspaces.com
+    region: us-east-1
+    bucketName: warehouse
+    accessKey: ""
+    secretKey: ""
+    existingSecret: ""                   # name of Secret with keys: aws-access-key-id, aws-secret-access-key
+    existingSecretAccessKeyKey: aws-access-key-id
+    existingSecretSecretKeyKey: aws-secret-access-key
+
   image:
-    repository: cloudwatch-log-persist
+    repository: minio/minio
     tag: latest
     pullPolicy: IfNotPresent
-  config:
-    warehouse: file:///warehouse
-    catalog: postgresql
-    namespace: default
-    table_name: cloudwatch_logs
-    database:
-      host: postgres-release
-      port: 5432
-      name: iceberg_db
-      user: admin
-      password: admin123
-    compaction:
-      enabled: true
-      interval_seconds: 300
-      max_data_files: 50
-      target_file_size_mb: 128
-    retention:
-      enabled: true
-      days: 7
-    buffer:
-      max_size: 50000
-      flush_interval_seconds: 10
+  auth:
+    rootUser: admin
+    rootPassword: admin123
+    existingSecret: ""          # leave empty to auto-create secret from auth values
+  bucketName: warehouse
   persistence:
-    enabled: false
-    size: 10Gi
+    enabled: true
+    size: 50Gi
     storageClass: ""
+  service:
+    type: ClusterIP
+    port: 9000
+    consolePort: 9001
   resources:
     requests:
       cpu: 100m
@@ -73,10 +88,101 @@ cloudwatchService:
     limits:
       cpu: 1000m
       memory: 2Gi
+
+# ---------------------------------------------------------------------------
+# logs-service — the main application
+# ---------------------------------------------------------------------------
+cloudwatchService:
+  enabled: true
+  image:
+    repository: cloudwatch-log-persist
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  config:
+    # Archive Iceberg tier — S3-backed
+    warehouse: "s3a://warehouse/"
+    catalog: postgresql
+    namespace: default
+    table_name: cloudwatch_logs
+
+    loki:
+      table_name: loki_logs
+
+    # Labels extracted from ingest payloads and stored as dedicated columns
+    ingest:
+      labels:
+        columns:
+          - env
+          - service
+          - host
+          - region
+          - app
+          - pod
+          - container
+          - level
+          - namespace
+
+    # S3 / MinIO connection details (endpoint auto-derived from minio service if minio.enabled)
+    s3:
+      # Override endpoint if using an external S3 or different namespace
+      endpoint: ""              # auto-set to http://<release>-minio:9000 when minio.enabled=true
+      region: us-east-1
+
+    # PostgreSQL connection (auto-derived from postgres service when postgres.enabled)
+    database:
+      host: ""                  # auto-set to <release>-postgres when postgres.enabled=true
+      port: 5432
+      name: iceberg_db
+      user: admin
+
+    # ---- Hot tier: in-memory buffer + WAL ----
+    buffer:
+      max_size: 50000
+      flush_interval_seconds: 60
+      worker_threads: 2
+      wal_enabled: true
+      wal_dir: wal/
+
+    # ---- 3-tier compaction pipeline ----
+    compaction:
+      enabled: true
+      interval_seconds: 300        # full WAL→cold→archive cycle every 5 min
+      max_data_files: 1000
+      local_staging_dir: /app/staging   # mounted as stagingPvc below
+      wal_max_rows: 500000              # back-pressure threshold (WAL+cold total)
+      wal_flush_interval_seconds: 30    # WAL→cold flush independent of full compaction
+
+    retention:
+      enabled: true
+      days: 7
+
+    partition:
+      strategy: log_group
+      log_group_buckets: 10
+
+  # Persistent volume for the staging tier (/app/staging — WAL JSONL + cold Iceberg files)
+  staging:
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: ""
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
   service:
-    type: LoadBalancer
+    type: ClusterIP
     port: 4588
 
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
 ingress:
   enabled: false
   className: ""
@@ -88,5 +194,9 @@ ingress:
           pathType: Prefix
   tls: []
 
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
 volumePermissions:
   enabled: true
+

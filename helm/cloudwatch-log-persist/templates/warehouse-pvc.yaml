@@ -1,8 +1,11 @@
-{{- if and .Values.cloudwatchService.enabled .Values.cloudwatchService.persistence.enabled }}
+{{- if and .Values.cloudwatchService.enabled .Values.cloudwatchService.staging.persistence.enabled }}
+# Persistent volume for the staging tier — WAL JSONL files + cold Iceberg Parquet files.
+# Mounted at /app/staging inside the logs-service container.
+# This volume MUST survive pod restarts; losing it means losing un-compacted hot/cold data.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "cloudwatch-log-persist.fullname" . }}-warehouse-pvc
+  name: {{ include "cloudwatch-log-persist.fullname" . }}-staging-pvc
   labels:
     {{- include "cloudwatch-log-persist.labels" . | nindent 4 }}
     app.kubernetes.io/component: cloudwatch-service
@@ -11,8 +14,9 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: {{ .Values.cloudwatchService.persistence.size }}
-  {{- if .Values.cloudwatchService.persistence.storageClass }}
-  storageClassName: {{ .Values.cloudwatchService.persistence.storageClass }}
+      storage: {{ .Values.cloudwatchService.staging.persistence.size }}
+  {{- if .Values.cloudwatchService.staging.persistence.storageClass }}
+  storageClassName: {{ .Values.cloudwatchService.staging.persistence.storageClass }}
   {{- end }}
 {{- end }}
+

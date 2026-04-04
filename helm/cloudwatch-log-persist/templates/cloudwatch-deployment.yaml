@@ -14,6 +14,9 @@ spec:
       app.kubernetes.io/component: cloudwatch-service
   template:
     metadata:
+      annotations:
+        # Roll pods when configmap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         {{- include "cloudwatch-log-persist.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: cloudwatch-service
@@ -26,11 +29,11 @@ spec:
             - sh
             - -c
             - |
-              mkdir -p /warehouse/default /warehouse/default/cloudwatch_logs /warehouse/default/cloudwatch_logs/data /warehouse/default/cloudwatch_logs/metadata
-              chmod -R 777 /warehouse
+              mkdir -p /app/staging/wal /app/staging/cold
+              chmod -R 777 /app/staging
           volumeMounts:
-            - name: warehouse
-              mountPath: /warehouse
+            - name: staging
+              mountPath: /app/staging
       {{- end }}
       containers:
         - name: cloudwatch-service
@@ -45,37 +48,52 @@ spec:
               value: "1"
             - name: PYTHONPATH
               value: /app/src
-          envFrom:
-            - configMapRef:
-                name: {{ include "cloudwatch-log-persist.fullname" . }}-config
+          command:
+            - python
+            - -m
+            - flask
+            - --app
+            - service.server
+            - run
+            - --host
+            - 0.0.0.0
+            - --port
+            - "4588"
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml
               subPath: config.yaml
-            - name: warehouse
-              mountPath: /warehouse
+            - name: staging
+              mountPath: /app/staging
           {{- with .Values.cloudwatchService.resources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
           livenessProbe:
-            tcpSocket:
-              port: 4588
+            httpGet:
+              path: /health
+              port: http
             initialDelaySeconds: 30
-            periodSeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
-            tcpSocket:
-              port: 4588
-            initialDelaySeconds: 5
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: config
           configMap:
             name: {{ include "cloudwatch-log-persist.fullname" . }}-config
-        - name: warehouse
-          {{- if .Values.cloudwatchService.persistence.enabled }}
+        - name: staging
+          {{- if .Values.cloudwatchService.staging.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "cloudwatch-log-persist.fullname" . }}-warehouse-pvc
+            claimName: {{ include "cloudwatch-log-persist.fullname" . }}-staging-pvc
           {{- else }}
           emptyDir: {}
           {{- end }}
 {{- end }}
+

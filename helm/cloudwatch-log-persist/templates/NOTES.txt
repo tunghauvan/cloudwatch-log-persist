@@ -1,37 +1,130 @@
-Thank you for installing {{ .Chart.Name }}.
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}.
 
-Your release is named {{ .Release.Name }}.
+Release name: {{ .Release.Name }}
+Namespace:    {{ .Release.Namespace }}
 
-To learn more about the release, try:
+== 3-Tier Log Persistence ==
 
-  $ helm status {{ .Release.Name }}
-  $ helm get all {{ .Release.Name }}
-
-== CloudWatch Log Persist ==
-
-The CloudWatch Local Service is now running.
+  Hot  → WAL JSONL files on staging PVC (/app/staging)
+  Cold → local Iceberg (PostgreSQL catalog, namespace: cold)
+  Archive → S3/MinIO Iceberg (PostgreSQL catalog, namespace: default)
 
 {{- if .Values.cloudwatchService.enabled }}
-CloudWatch Service:
-  URL: http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}
 
-{{- if eq .Values.cloudwatchService.service.type "LoadBalancer" }}
-  External URL: http://$(kubectl get svc {{ include "cloudwatch-log-persist.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-{{- end }}
+== logs-service ==
+
+  CloudWatch API:  http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}
+  Loki API:        http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}/loki/api/v1
+  Health:          http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}/health
+  Warehouse stats: http://{{ include "cloudwatch-log-persist.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.cloudwatchService.service.port }}/warehouse/stats
+
+  Port-forward:
+    kubectl port-forward svc/{{ include "cloudwatch-log-persist.fullname" . }} 4588:{{ .Values.cloudwatchService.service.port }} -n {{ .Release.Namespace }}
+
 {{- end }}
 
 {{- if .Values.postgres.enabled }}
-PostgreSQL (Iceberg Catalog):
-  Host: {{ include "cloudwatch-log-persist.fullname" . }}-postgres.{{ .Release.Namespace }}.svc.cluster.local
-  Port: 5432
+
+== PostgreSQL (Iceberg Catalog) — In-Chart ==
+
+  Host:     {{ include "cloudwatch-log-persist.postgresHost" . }}.{{ .Release.Namespace }}.svc.cluster.local:5432
   Database: {{ .Values.postgres.auth.database }}
-  User: {{ .Values.postgres.auth.username }}
+  User:     {{ .Values.postgres.auth.username }}
+  Secret:   {{ include "cloudwatch-log-persist.postgresSecretName" . }}
+
+{{- else if .Values.postgres.external.host }}
+
+== PostgreSQL (Iceberg Catalog) — External ==
+
+  Host:     {{ .Values.postgres.external.host }}:{{ .Values.postgres.external.port }}
+  Database: {{ .Values.postgres.external.database }}
+  User:     {{ .Values.postgres.external.username }}
+  {{- if .Values.postgres.external.existingSecret }}
+  Secret:   {{ .Values.postgres.external.existingSecret }}
+  {{- else }}
+  Password: (set via postgres.external.password)
+  {{- end }}
+
 {{- end }}
+
+{{- if .Values.minio.enabled }}
+
+== MinIO (Archive S3 Storage) — In-Chart ==
+
+  Endpoint: {{ include "cloudwatch-log-persist.minioEndpoint" . }}
+  Bucket:   {{ .Values.minio.bucketName }}
+  Secret:   {{ include "cloudwatch-log-persist.minioSecretName" . }}
+
+  Port-forward console:
+    kubectl port-forward svc/{{ include "cloudwatch-log-persist.fullname" . }}-minio {{ .Values.minio.service.consolePort }}:{{ .Values.minio.service.consolePort }} -n {{ .Release.Namespace }}
+    # then open http://localhost:{{ .Values.minio.service.consolePort }}
+
+{{- else if .Values.minio.external.endpoint }}
+
+== S3 Storage (Archive) — External ==
+
+  Endpoint: {{ .Values.minio.external.endpoint }}
+  Bucket:   {{ .Values.minio.external.bucketName }}
+  Region:   {{ .Values.minio.external.region }}
+  {{- if .Values.minio.external.existingSecret }}
+  Secret:   {{ .Values.minio.external.existingSecret }}
+  {{- else }}
+  Access Key: (set via minio.external.accessKey)
+  {{- end }}
+
+{{- end }}
+
+== Useful commands ==
+
+  # Check all pods
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+  # Trigger WAL→cold flush manually
+  curl -X POST http://<host>:4588/flush
+
+  # View full warehouse health
+  curl http://<host>:4588/warehouse/stats
+
 
 == Configuration ==
 
 To update configuration, edit the configmap:
   $ kubectl edit configmap {{ include "cloudwatch-log-persist.fullname" . }}-config -n {{ .Release.Namespace }}
+
+== Using External PostgreSQL and S3 ==
+
+To deploy with existing PostgreSQL and S3 services:
+
+  helm install my-release helm/cloudwatch-log-persist/ \
+    --set postgres.enabled=false \
+    --set postgres.external.host=rds.example.com \
+    --set postgres.external.port=5432 \
+    --set postgres.external.database=iceberg_db \
+    --set postgres.external.username=admin \
+    --set postgres.external.password="YOUR_PASSWORD" \
+    --set minio.enabled=false \
+    --set minio.external.endpoint=https://s3.amazonaws.com \
+    --set minio.external.region=us-east-1 \
+    --set minio.external.bucketName=warehouse \
+    --set minio.external.accessKey="YOUR_KEY" \
+    --set minio.external.secretKey="YOUR_SECRET"
+
+Or provide credentials via Kubernetes Secrets:
+
+  # Create external secrets first
+  kubectl create secret generic external-postgres-secret --from-literal=password=YOUR_PASSWORD
+  kubectl create secret generic external-s3-secret \
+    --from-literal=aws-access-key-id=YOUR_KEY \
+    --from-literal=aws-secret-access-key=YOUR_SECRET
+
+  # Then deploy with secret references
+  helm install my-release helm/cloudwatch-log-persist/ \
+    --set postgres.enabled=false \
+    --set postgres.external.host=rds.example.com \
+    --set postgres.external.existingSecret=external-postgres-secret \
+    --set minio.enabled=false \
+    --set minio.external.endpoint=https://s3.amazonaws.com \
+    --set minio.external.existingSecret=external-s3-secret
 
 == Testing ==
 

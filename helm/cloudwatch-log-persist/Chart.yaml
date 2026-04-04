@@ -1,14 +1,19 @@
 apiVersion: v2
 name: cloudwatch-log-persist
-description: A Helm chart for CloudWatch Logs Local Service with Iceberg warehouse
+description: >
+  CloudWatch-compatible log persistence service with 3-tier storage:
+  WAL (JSONL) → cold Iceberg (local FS, PostgreSQL catalog) → archive Iceberg (S3/MinIO, PostgreSQL catalog).
+  Includes Loki-compatible API and Grafana-ready metrics.
 type: application
-version: 0.1.0
-appVersion: "1.0"
+version: 0.2.0
+appVersion: "2.0"
 keywords:
   - cloudwatch
+  - loki
   - logs
   - iceberg
-  - localstack
+  - minio
+  - s3
 maintainers:
   - name: DevTeam
     email: dev@example.com

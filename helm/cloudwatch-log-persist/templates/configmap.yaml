@@ -1,29 +1,71 @@
+{{- $cfg := .Values.cloudwatchService.config -}}
+{{- $relName := include "cloudwatch-log-persist.fullname" . -}}
+{{- $pgHost := include "cloudwatch-log-persist.postgresHost" . -}}
+{{- $pgPort := include "cloudwatch-log-persist.postgresPort" . -}}
+{{- $pgDb := include "cloudwatch-log-persist.postgresDatabase" . -}}
+{{- $pgUser := include "cloudwatch-log-persist.postgresUsername" . -}}
+{{- $s3Endpoint := include "cloudwatch-log-persist.minioEndpoint" . -}}
+{{- $s3Bucket := include "cloudwatch-log-persist.s3BucketName" . -}}
+{{- $s3Region := include "cloudwatch-log-persist.s3Region" . -}}
+{{- $s3AccessKey := include "cloudwatch-log-persist.s3AccessKey" . -}}
+{{- $s3SecretKey := include "cloudwatch-log-persist.s3SecretKey" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "cloudwatch-log-persist.fullname" . }}-config
+  name: {{ $relName }}-config
   labels:
     {{- include "cloudwatch-log-persist.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    warehouse: {{ .Values.cloudwatchService.config.warehouse }}
-    catalog: {{ .Values.cloudwatchService.config.catalog }}
-    namespace: {{ .Values.cloudwatchService.config.namespace }}
-    table_name: {{ .Values.cloudwatchService.config.table_name }}
+    warehouse: {{ $cfg.warehouse }}
+    catalog: {{ $cfg.catalog }}
+    namespace: {{ $cfg.namespace }}
+    table_name: {{ $cfg.table_name }}
+
+    loki:
+      table_name: {{ $cfg.loki.table_name }}
+
+    s3:
+      endpoint: {{ $s3Endpoint }}
+      access_key: {{ $s3AccessKey }}
+      secret_key: {{ $s3SecretKey }}
+      region: {{ $s3Region }}
+      bucket: {{ $s3Bucket }}
+
     database:
-      host: {{ .Values.cloudwatchService.config.database.host }}
-      port: {{ .Values.cloudwatchService.config.database.port }}
-      name: {{ .Values.cloudwatchService.config.database.name }}
-      user: {{ .Values.cloudwatchService.config.database.user }}
-      password: {{ .Values.cloudwatchService.config.database.password }}
-    compaction:
-      enabled: {{ .Values.cloudwatchService.config.compaction.enabled }}
-      interval_seconds: {{ .Values.cloudwatchService.config.compaction.interval_seconds }}
-      max_data_files: {{ .Values.cloudwatchService.config.compaction.max_data_files }}
-      target_file_size_mb: {{ .Values.cloudwatchService.config.compaction.target_file_size_mb }}
-    retention:
-      enabled: {{ .Values.cloudwatchService.config.retention.enabled }}
-      days: {{ .Values.cloudwatchService.config.retention.days }}
+      host: {{ $pgHost }}
+      port: {{ $pgPort }}
+      name: {{ $pgDb }}
+      user: {{ $pgUser }}
+      password: {{ if .Values.postgres.enabled }}{{ .Values.postgres.auth.password }}{{ else }}{{ .Values.postgres.external.password }}{{ end }}
+
     buffer:
-      max_size: {{ .Values.cloudwatchService.config.buffer.max_size }}
-      flush_interval_seconds: {{ .Values.cloudwatchService.config.buffer.flush_interval_seconds }}
+      max_size: {{ $cfg.buffer.max_size }}
+      flush_interval_seconds: {{ $cfg.buffer.flush_interval_seconds }}
+      worker_threads: {{ $cfg.buffer.worker_threads }}
+      wal_enabled: {{ $cfg.buffer.wal_enabled }}
+      wal_dir: {{ $cfg.buffer.wal_dir }}
+
+    compaction:
+      enabled: {{ $cfg.compaction.enabled }}
+      interval_seconds: {{ $cfg.compaction.interval_seconds }}
+      max_data_files: {{ $cfg.compaction.max_data_files }}
+      local_staging_dir: {{ $cfg.compaction.local_staging_dir }}
+      wal_max_rows: {{ $cfg.compaction.wal_max_rows }}
+      wal_flush_interval_seconds: {{ $cfg.compaction.wal_flush_interval_seconds }}
+
+    retention:
+      enabled: {{ $cfg.retention.enabled }}
+      days: {{ $cfg.retention.days }}
+
+    partition:
+      strategy: {{ $cfg.partition.strategy }}
+      log_group_buckets: {{ $cfg.partition.log_group_buckets }}
+
+    ingest:
+      labels:
+        columns:
+          {{- range $cfg.ingest.labels.columns }}
+          - {{ . }}
+          {{- end }}
+
