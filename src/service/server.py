@@ -376,8 +376,20 @@ def flush_buffer():
             log_buffer._flush_queue.join()
         except Exception:
             pass
-        return jsonify({"status": "ok", "flushed": count})
-    return jsonify({"status": "ok", "flushed": 0})
+    else:
+        count = 0
+
+    # Move hot WAL → cold Iceberg so queries see data with full filter push-down
+    warehouse = get_warehouse()
+    if warehouse:
+        try:
+            loki_table = warehouse.config.get("loki", {}).get("table_name", "loki_logs")
+            warehouse.flush_wal(warehouse.table_name)
+            warehouse.flush_wal(loki_table)
+        except Exception as e:
+            logger.warning(f"[Flush] WAL flush error: {e}")
+
+    return jsonify({"status": "ok", "flushed": count})
 
 
 @app.route("/buffer/stats", methods=["GET"])
@@ -385,6 +397,15 @@ def buffer_stats():
     if log_buffer:
         return jsonify(log_buffer.stats())
     return jsonify({"error": "buffer not initialized"})
+
+
+@app.route("/warehouse/stats", methods=["GET"])
+def warehouse_stats():
+    """3-tier health: hot WAL, cold Iceberg, archive S3."""
+    warehouse = get_warehouse()
+    if not warehouse:
+        return jsonify({"error": "warehouse not available"}), 503
+    return jsonify(warehouse.get_stats())
 
 
 def shutdown():

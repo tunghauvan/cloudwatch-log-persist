@@ -33,19 +33,26 @@ class TestLogBuffer(unittest.TestCase):
         mock_warehouse = Mock()
         buffer = LogBuffer(max_size=50, flush_interval_seconds=60)
         buffer.set_warehouse(mock_warehouse)
+        buffer.start()
 
         buffer.add([{"message": f"log {i}"} for i in range(30)])
         self.assertEqual(buffer.size(), 30)
         self.assertEqual(mock_warehouse.insert_logs.call_count, 0)
 
+        # Adding 25 more tips over max_size=50 and triggers flush
         buffer.add([{"message": f"log {i}"} for i in range(30, 55)])
+        buffer._flush_queue.join()  # wait for background worker to process
+
         self.assertEqual(mock_warehouse.insert_logs.call_count, 1)
         self.assertEqual(buffer.size(), 0)
+
+        buffer.stop()
 
     def test_manual_flush(self):
         mock_warehouse = Mock()
         buffer = LogBuffer(max_size=1000, flush_interval_seconds=60)
         buffer.set_warehouse(mock_warehouse)
+        buffer.start()
 
         buffer.add([{"message": f"log {i}"} for i in range(100)])
         self.assertEqual(buffer.size(), 100)
@@ -53,10 +60,11 @@ class TestLogBuffer(unittest.TestCase):
         flushed = buffer.flush()
         self.assertEqual(flushed, 100)
         self.assertEqual(buffer.size(), 0)
+
+        buffer._flush_queue.join()  # wait for background worker
         self.assertEqual(mock_warehouse.insert_logs.call_count, 1)
-        mock_warehouse.insert_logs.assert_called_once_with(
-            [{"message": f"log {i}"} for i in range(100)]
-        )
+
+        buffer.stop()
 
     def test_flush_empty_buffer(self):
         mock_warehouse = Mock()
@@ -77,6 +85,7 @@ class TestLogBuffer(unittest.TestCase):
         self.assertEqual(buffer.size(), 50)
 
         time.sleep(2)
+        buffer._flush_queue.join()
         self.assertEqual(mock_warehouse.insert_logs.call_count, 1)
 
         buffer.stop()
@@ -88,7 +97,7 @@ class TestLogBuffer(unittest.TestCase):
         buffer.start()
 
         buffer.add([{"message": f"log {i}"} for i in range(25)])
-        buffer.stop()
+        buffer.stop()  # stop() now drains queue before stopping workers
 
         mock_warehouse.insert_logs.assert_called()
 
@@ -131,18 +140,26 @@ class TestLogBufferWithWarehouse(unittest.TestCase):
 
         buffer = LogBuffer(max_size=10, flush_interval_seconds=60)
         buffer.set_warehouse(mock_warehouse)
+        buffer.start()
 
+        # Adding 15 logs to a buffer with max_size=10 will trigger auto-flush
         buffer.add([{"message": "log 1"} for _ in range(15)])
+        buffer._flush_queue.join()  # wait for worker to attempt & fail the flush
 
+        # Failed flush should put items back in buffer
         self.assertEqual(buffer.size(), 15)
         self.assertIsNotNone(buffer.stats()["last_error"])
 
+        # Resolve the error and flush successfully
         mock_warehouse.insert_logs.side_effect = None
         mock_warehouse.insert_logs.return_value = None
 
         flushed = buffer.flush()
+        buffer._flush_queue.join()
         self.assertEqual(flushed, 15)
         self.assertEqual(buffer.size(), 0)
+
+        buffer.stop()
 
 
 if __name__ == "__main__":

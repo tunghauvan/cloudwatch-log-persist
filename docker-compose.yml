@@ -26,6 +26,7 @@ services:
       - ./data-warehouse:/warehouse
       - ./config.yaml:/app/config.yaml
       - ./wal:/app/wal
+      - staging_data:/app/staging
     ports:
       - 4588:4588
     environment:
@@ -101,3 +102,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  staging_data:

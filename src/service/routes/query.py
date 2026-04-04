@@ -12,6 +12,13 @@ from service.routes.query_parser import parse_query
 
 query_bp = Blueprint("query", __name__)
 
+# Lazy-import PyIceberg expressions only when warehouse is available
+try:
+    from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThanOrEqual, AlwaysTrue
+    _PYICEBERG_EXPR_AVAILABLE = True
+except ImportError:
+    _PYICEBERG_EXPR_AVAILABLE = False
+
 
 class QueryExecution:
     def __init__(
@@ -133,18 +140,28 @@ def _execute_query(execution: QueryExecution):
 
     if warehouse:
         try:
-            where_parts = [f"log_group_name == '{execution.log_group_name}'"]
+            # Build typed Expression objects for predicate push-down into Parquet row groups
+            if _PYICEBERG_EXPR_AVAILABLE:
+                filter_expression = EqualTo("log_group_name", execution.log_group_name)
+                if execution.start_time:
+                    ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
+                    filter_expression = And(filter_expression, GreaterThanOrEqual("timestamp", ts_start))
+                if execution.end_time:
+                    ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
+                    filter_expression = And(filter_expression, LessThanOrEqual("timestamp", ts_end))
+                filter_expr = None
+            else:
+                filter_expression = None
+                where_parts = [f"log_group_name == '{execution.log_group_name}'"]
+                if execution.start_time:
+                    ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
+                    where_parts.append(f"timestamp >= '{ts_start.isoformat()}'")
+                if execution.end_time:
+                    ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
+                    where_parts.append(f"timestamp <= '{ts_end.isoformat()}'")
+                filter_expr = " AND ".join(where_parts)
 
-            # Use ISO datetime strings so PyIceberg can prune partitions correctly
-            if execution.start_time:
-                ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
-                where_parts.append(f"timestamp >= '{ts_start.isoformat()}'")
-            if execution.end_time:
-                ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
-                where_parts.append(f"timestamp <= '{ts_end.isoformat()}'")
-
-            filter_expr = " AND ".join(where_parts)
-            print(f"[Query] filter_expr: {filter_expr}")
+            print(f"[Query] filter_expression={filter_expression is not None} filter_expr={filter_expr}")
 
             limit = (
                 execution.parsed_query.get("limit") or 1000
@@ -161,7 +178,11 @@ def _execute_query(execution: QueryExecution):
                 else []
             )
             fetch_limit = limit * 3 if cwl_filters else limit
-            result = warehouse.query(filter_expr=filter_expr, limit=fetch_limit)
+            result = warehouse.query(
+                filter_expr=filter_expr,
+                filter_expression=filter_expression,
+                limit=fetch_limit,
+            )
 
             # Batch-convert Arrow table to Python dicts (vectorised, not row-by-row)
             rows_dict = result.to_pydict()

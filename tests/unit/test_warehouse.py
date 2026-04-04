@@ -6,6 +6,11 @@ import tempfile
 import shutil
 import sys
 
+# Ensure pandas is in sys.modules before any test fixture clears src.warehouse,
+# so that warehouse.py's `import pandas` never re-initializes pandas from scratch
+# (which would hit a Python 3.14 / dateutil incompatibility).
+import pandas  # noqa: F401
+
 
 @pytest.fixture(autouse=True)
 def reset_modules():

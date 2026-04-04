@@ -108,18 +108,17 @@ class LogBuffer:
             logger.info(f"Started {self._num_workers} worker threads.")
 
     def stop(self):
+        # Drain memory buffer into the queue while workers are still alive
+        self.flush()
+        self._flush_queue.join()
+
         self._stop_event.set()
-        
-        # Wait for workers to finish current tasks
-        logger.info("Stopping workers and flushing remaining logs...")
+
         for t in self._worker_threads:
             t.join(timeout=5)
-            
+
         if self._flush_thread:
             self._flush_thread.join(timeout=10)
-        
-        # Final explicit flush of whatever is in memory buffer
-        self.flush()
 
     def _worker_loop(self):
         """Background worker consuming logs from the queue and writing to warehouse."""

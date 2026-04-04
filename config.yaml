@@ -28,6 +28,9 @@ compaction:
   enabled: true
   interval_seconds: 300
   max_data_files: 1000
+  local_staging_dir: /app/staging   # Mounted as a persistent Docker volume — survives restarts
+  wal_max_rows: 500000              # Pause ingest if WAL+cold exceeds this (backpressure)
+  wal_flush_interval_seconds: 30   # Flush WAL → cold every 30 s (independent of full compaction)
 
 retention:
   enabled: true

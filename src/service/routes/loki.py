@@ -613,10 +613,195 @@ def loki_query():
     )
 
 
+def _parse_step_seconds(step_str, start_ms: int, end_ms: int, max_data_points: int = 500) -> int:
+    """Parse a Loki step string to seconds; auto-calculate when missing."""
+    if step_str:
+        try:
+            if isinstance(step_str, str):
+                if step_str.endswith("ms"):
+                    return max(1, int(step_str[:-2]) // 1000)
+                if step_str.endswith("s"):
+                    return max(1, int(step_str[:-1]))
+                if step_str.endswith("m"):
+                    return max(1, int(step_str[:-1]) * 60)
+                if step_str.endswith("h"):
+                    return max(1, int(step_str[:-1]) * 3600)
+                return max(1, int(float(step_str)))
+        except Exception:
+            pass
+    range_s = max(1, (end_ms - start_ms) / 1000.0)
+    return max(1, int(range_s / max(max_data_points, 1)))
+
+
+def _classified_level(msg_lower: str) -> str:
+    if "error" in msg_lower or "exception" in msg_lower or "fatal" in msg_lower:
+        return "error"
+    if "warn" in msg_lower:
+        return "warn"
+    if "debug" in msg_lower:
+        return "debug"
+    if "info" in msg_lower:
+        return "info"
+    return "unknown"
+
+
+def _handle_metric_query(warehouse, query: str, start_ms: int, end_ms: int,
+                          log_group, log_stream, labels_filter: dict, message_filter):
+    """
+    Fast path for Loki metric queries (count_over_time, rate, sum by …).
+
+    Key optimisations vs the old code:
+    - Only fetches `timestamp` + `message` columns from Iceberg (column projection).
+    - Uses PyArrow vectorised compute for bucketing instead of Python row-by-row.
+    - Caps the fetch at 2 M rows (metric aggregation is always approximate anyway).
+    - Empty-string label values are already stripped by the caller.
+    """
+    import pyarrow.compute as pc
+    import pyarrow as pa
+
+    step_str = (
+        request.args.get("step", "") if request.method == "GET"
+        else (request.get_json(silent=True) or {}).get("step", "")
+    )
+    max_dp = int(
+        request.args.get("maxDataPoints", 500) if request.method == "GET"
+        else (request.get_json(silent=True) or {}).get("maxDataPoints", 500)
+    )
+    step_seconds = _parse_step_seconds(step_str, start_ms, end_ms, max_dp)
+
+    # Extract "by (label)" from query
+    agg_label = None
+    by_match = re.search(r"by\s*\(\s*([^)]+)\s*\)", query, re.IGNORECASE)
+    if by_match:
+        agg_label = by_match.group(1).strip()
+
+    # For detected_level we need message; otherwise timestamp-only is enough.
+    need_message = (agg_label == "detected_level" or bool(message_filter))
+
+    try:
+        warehousing_labels = {
+            {"service_name": "service"}.get(k, k): v
+            for k, v in labels_filter.items()
+        }
+
+        # Build filter expression directly (avoids full dict→event conversion)
+        from pyiceberg.expressions import (
+            And, EqualTo, GreaterThanOrEqual, LessThanOrEqual, AlwaysTrue
+        )
+        from datetime import datetime, timezone
+
+        fexpr = AlwaysTrue()
+        if log_group:
+            fexpr = And(fexpr, EqualTo("log_group_name", log_group))
+        if log_stream:
+            fexpr = And(fexpr, EqualTo("log_stream_name", log_stream))
+        if start_ms:
+            ts_s = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            fexpr = And(fexpr, GreaterThanOrEqual("timestamp", ts_s))
+        if end_ms:
+            ts_e = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            fexpr = And(fexpr, LessThanOrEqual("timestamp", ts_e))
+        for k, v in warehousing_labels.items():
+            fexpr = And(fexpr, EqualTo(f"label_{k}", v))
+
+        # Column projection: only pull what we need
+        sel = ("timestamp", "message") if need_message else ("timestamp",)
+
+        arrow_tbl = warehouse.query(
+            filter_expression=fexpr,
+            limit=2_000_000,
+            table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
+            selected_fields=sel,
+        )
+    except Exception as e:
+        logger.error(f"[metric_query] Warehouse error: {e}", exc_info=True)
+        arrow_tbl = pa.table({"timestamp": pa.array([], type=pa.timestamp("us")),
+                               "message": pa.array([], type=pa.utf8())})
+
+    total_lines = arrow_tbl.num_rows
+
+    # ---- Vectorised bucketing with PyArrow ----
+    # Convert timestamp column (datetime[us]) → epoch-seconds int64
+    ts_col = arrow_tbl.column("timestamp")
+    # Cast to int64 microseconds, divide to get seconds
+    ts_sec = pc.cast(ts_col, pa.int64())                       # µs since epoch
+    ts_sec = pc.divide(ts_sec, pa.scalar(1_000_000, pa.int64()))  # → seconds
+    # Floor to bucket boundary: int64 / int64 in PyArrow = truncating integer division
+    step_scalar = pa.scalar(step_seconds, pa.int64())
+    bucket_col = pc.multiply(
+        pc.divide(ts_sec, step_scalar),
+        step_scalar,
+    )
+
+    if agg_label and agg_label != "detected_level" and f"label_{agg_label}" in arrow_tbl.schema.names:
+        # Group by stored label column
+        mapped = {"service_name": "service"}.get(agg_label, agg_label)
+        col_name = f"label_{mapped}"
+        group_col = arrow_tbl.column(col_name)
+    elif agg_label == "detected_level" and need_message:
+        # Classify each row's message
+        msgs = arrow_tbl.column("message").to_pylist()
+        levels = [_classified_level((m or "").lower()) for m in msgs]
+        group_col = pa.array(levels, type=pa.utf8())
+    else:
+        group_col = None
+
+    # Build bucket → label_val → count using a plain dict (fast enough for ≤2 M rows)
+    time_buckets: dict = {}
+    bucket_list = bucket_col.to_pylist()
+    group_list = group_col.to_pylist() if group_col is not None else None
+
+    for i, bkt in enumerate(bucket_list):
+        if bkt is None:
+            continue
+        lv = group_list[i] if group_list is not None else "total"
+        if lv is None:
+            lv = "unknown"
+        key = (lv, int(bkt))
+        time_buckets[key] = time_buckets.get(key, 0) + 1
+
+    # Build Loki matrix response
+    label_series: dict = {}
+    for (lv, bkt), count in time_buckets.items():
+        label_series.setdefault(lv, []).append([bkt, str(count)])
+
+    result = []
+    for lv, values in label_series.items():
+        metric = {agg_label: lv} if agg_label else {}
+        result.append({"metric": metric, "values": sorted(values)})
+
+    if not result:
+        result = [{"metric": {}, "values": []}]
+
+    return jsonify({
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": result,
+            "stats": {
+                "summary": {
+                    "bytesProcessedPerSecond": 0,
+                    "linesProcessedPerSecond": 0,
+                    "totalBytesProcessed": 0,
+                    "totalLinesProcessed": total_lines,
+                    "execTime": 0.001,
+                    "queueTime": 0,
+                    "subqueries": 0,
+                    "totalEntriesReturned": len(result),
+                    "splits": 1,
+                    "shards": 0,
+                    "totalPostFilterLines": total_lines,
+                    "totalStructuredMetadataBytesProcessed": 0,
+                },
+            },
+        },
+    })
+
+
 @loki_bp.route("/loki/api/v1/query_range", methods=["GET", "POST"])
 def loki_query_range():
-    print(
-        f"[Debug] Loki Query Range received. Params: {request.args if request.method == 'GET' else 'POST body'}"
+    logger.debug(
+        f"Loki Query Range received. Params: {request.args if request.method == 'GET' else 'POST body'}"
     )
     warehouse = get_warehouse()
     if not warehouse:
@@ -652,25 +837,33 @@ def loki_query_range():
     log_group, log_stream, message_filter, labels_filter, regex_label = (
         parse_logql_filter(query)
     )
-    print(
-        f"[Debug] Parsed filter: group={log_group}, stream={log_stream}, labels={labels_filter}"
+    logger.debug(
+        f"[query_range] group={log_group}, stream={log_stream}, labels={labels_filter}"
     )
 
-    # If labels_filter has service_name but warehouse uses service (or vice versa)
-    # The warehouse.get_logs already does some mapping, but we should ensure consistency
-    
-    try:
-        # Pre-process labels_filter to ensure it matches warehouse expectations
-        # Warehouse expects 'service' if 'service_name' is passed in LogQL
-        warehousing_labels = {}
-        for k, v in labels_filter.items():
-            mapped_key = {"service_name": "service"}.get(k, k)
-            warehousing_labels[mapped_key] = v
+    # Drop empty-string label values: Grafana sends {env=""} meaning "all envs",
+    # not "only rows where env column is literally empty".
+    labels_filter = {k: v for k, v in labels_filter.items() if v != ""}
 
-        # Fetch only as many rows as we need for regular log queries.
-        # Metric queries still read the full range later in this handler.
-        fetch_limit = None if is_metric_query(query) else limit
-        if message_filter and fetch_limit is not None:
+    # -----------------------------------------------------------------------
+    # Fast path for metric queries (count_over_time, rate, sum by, …)
+    # -----------------------------------------------------------------------
+    if is_metric_query(query):
+        return _handle_metric_query(
+            warehouse, query, start, end, log_group, log_stream,
+            labels_filter, message_filter
+        )
+
+    # -----------------------------------------------------------------------
+    # Regular log query
+    # -----------------------------------------------------------------------
+    try:
+        warehousing_labels = {
+            {"service_name": "service"}.get(k, k): v
+            for k, v in labels_filter.items()
+        }
+        fetch_limit = limit
+        if message_filter:
             fetch_limit = max(fetch_limit * 10, 1000)
 
         events = warehouse.get_logs(
@@ -724,154 +917,9 @@ def loki_query_range():
                     filtered_events.append(e)
 
     logger.debug(f" Filtering done. {len(filtered_events)} events matched.")
-    
-    # Only apply the limit for regular log queries to keep Grafana happy.
-    # For metric queries, we want to use all matched events.
-    if not is_metric_query(query):
-        filtered_events = filtered_events[:limit]
+    filtered_events = filtered_events[:limit]
 
-    # Check if this is a metric query (aggregation like count_over_time, sum by, etc.)
-    if is_metric_query(query):
-        # Parse step parameter - auto-calculate if empty
-        step_str = (
-            request.args.get("step", "")
-            if request.method == "GET"
-            else (request.json or {}).get("step", "")
-        )
-
-        # Get maxDataPoints for auto step calculation
-        max_data_points = int(
-            request.args.get("maxDataPoints", 500)
-            if request.method == "GET"
-            else (request.json or {}).get("maxDataPoints", 500)
-        )
-
-        # Auto-calculate step if not provided
-        if not step_str or step_str == "":
-            # Calculate step based on time range and max data points
-            # Converting start/end from ms to seconds first
-            range_seconds = (end - start) / 1000.0
-            auto_step = max(1, int(range_seconds / max(max_data_points, 1)))
-            step_seconds = auto_step
-            print(
-                f"[Debug] Auto-calculated step: {step_seconds}s from range {range_seconds}s and maxDataPoints {max_data_points}"
-            )
-        else:
-            try:
-                if isinstance(step_str, str):
-                    if step_str.endswith("s"):
-                        step_seconds = int(step_str[:-1])
-                    elif step_str.endswith("m"):
-                        step_seconds = int(step_str[:-1]) * 60
-                    elif step_str.endswith("h"):
-                        step_seconds = int(step_str[:-1]) * 3600
-                    else:
-                        step_seconds = int(float(step_str))
-                else:
-                    step_seconds = int(step_str)
-            except:
-                # Fallback to auto-calculate
-                range_seconds = (end - start) / 1000.0
-                step_seconds = max(1, int(range_seconds / max(max_data_points, 1)))
-                print(
-                    f"[Debug] Step parse failed, using auto-calculated: {step_seconds}s"
-                )
-
-        # Extract aggregation label (e.g., "by (detected_level)")
-        agg_label = None
-        if "by (" in query.lower():
-            import re
-
-            match = re.search(r"by\s*\(\s*([^)]+)\s*\)", query, re.IGNORECASE)
-            if match:
-                agg_label = match.group(1).strip()
-
-        # Build matrix result (time series)
-        result = []
-        total_bytes = 0
-        total_lines = len(filtered_events)
-
-        # Group by aggregation label and time bucket
-        time_buckets = {}
-        for e in filtered_events:
-            ts_ms = e.get("timestamp", 0)
-            if isinstance(ts_ms, int) and ts_ms > 1e12:
-                # Convert to seconds and round to step
-                bucket_ts = int(ts_ms / 1000 / step_seconds) * step_seconds
-            else:
-                bucket_ts = int(time.time() / step_seconds) * step_seconds
-
-            # Get label value for grouping
-            if agg_label:
-                if agg_label == "detected_level":
-                    # Extract level from message
-                    msg = e.get("message", "").lower()
-                    if "error" in msg:
-                        label_val = "error"
-                    elif "warn" in msg:
-                        label_val = "warn"
-                    elif "info" in msg:
-                        label_val = "info"
-                    elif "debug" in msg:
-                        label_val = "debug"
-                    else:
-                        label_val = "unknown"
-                else:
-                    label_mapping = {"service_name": "service"}
-                    mapped_key = label_mapping.get(agg_label, agg_label)
-                    label_val = e.get(f"label_{mapped_key}", "unknown")
-            else:
-                label_val = "total"
-
-            key = (label_val, bucket_ts)
-            time_buckets[key] = time_buckets.get(key, 0) + 1
-            total_bytes += len(e.get("message", "").encode("utf-8"))
-
-        # Build matrix result
-        if time_buckets:
-            # Group by label value
-            label_values = {}
-            for (label_val, bucket_ts), count in time_buckets.items():
-                if label_val not in label_values:
-                    label_values[label_val] = []
-                label_values[label_val].append([bucket_ts, str(count)])
-
-            for label_val, values in label_values.items():
-                metric = {}
-                if agg_label:
-                    metric[agg_label] = label_val
-                result.append({"metric": metric, "values": sorted(values)})
-        else:
-            # Return empty result
-            result = [{"metric": {}, "values": []}]
-
-        return jsonify(
-            {
-                "status": "success",
-                "data": {
-                    "resultType": "matrix",
-                    "result": result,
-                    "stats": {
-                        "summary": {
-                            "bytesProcessedPerSecond": 0,
-                            "linesProcessedPerSecond": 0,
-                            "totalBytesProcessed": total_bytes,
-                            "totalLinesProcessed": total_lines,
-                            "execTime": 0.001,
-                            "queueTime": 0,
-                            "subqueries": 0,
-                            "totalEntriesReturned": len(result),
-                            "splits": 1,
-                            "shards": 0,
-                            "totalPostFilterLines": total_lines,
-                            "totalStructuredMetadataBytesProcessed": 0,
-                        }
-                    },
-                },
-            }
-        )
-
-    # Regular log query - return streams (non-streaming for optimal performance)
+    # Regular log query - return streams
     logs = [
         {
             "timestamp": e.get("timestamp", 0),
