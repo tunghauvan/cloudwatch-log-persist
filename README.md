@@ -297,9 +297,11 @@ See [docs/COST_ANALYSIS_REPORT.md](docs/COST_ANALYSIS_REPORT.md) for detailed br
 
 ## 📚 API Reference
 
+**Complete API documentation**: See [docs/API.md](docs/API.md) for detailed endpoint specs, examples, and error codes.
+
 ### CloudWatch Logs API
 
-**Supported Endpoints**:
+**Supported Endpoints** (see [docs/API.md#cloudwatch-logs-api](docs/API.md#cloudwatch-logs-api)):
 - `PutLogEvents` — Ingest events
 - `GetLogEvents` — Query by log group/stream and time range
 - `DescribeLogGroups` — List log groups
@@ -312,9 +314,9 @@ See [docs/COST_ANALYSIS_REPORT.md](docs/COST_ANALYSIS_REPORT.md) for detailed br
 
 ### Loki Query API
 
-**Endpoints**:
+**Endpoints** (see [docs/API.md#loki-query-api](docs/API.md#loki-query-api)):
 - `GET /loki/api/v1/query` — Instant query (LogQL)
-- `GET /loki/api/v1/query_range` — Time-range query
+- `GET /loki/api/v1/query_range` — Time-range query with bucketing
 - `POST /loki/api/v1/push` — Ingest via Loki protocol
 
 **Supported Aggregations**:
@@ -322,11 +324,14 @@ See [docs/COST_ANALYSIS_REPORT.md](docs/COST_ANALYSIS_REPORT.md) for detailed br
 - `rate(expr, [step])`
 - `sum_over_time(expr, [step])`
 - `min/max_over_time(expr, [step])`
+- `by (label)` — Group by label (e.g., `by (label_env)`)
 
 **Label Matchers**:
 - `{log_group_name="..."}` — Exact match
 - `{log_group_name=~"..."}` — Regex match
 - `{label_env="prod"}` — Custom labels
+
+See [docs/API.md#logql-query-examples](docs/API.md#logql-query-examples) for advanced examples.
 
 ## 🛠️ Development
 
