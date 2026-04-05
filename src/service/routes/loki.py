@@ -539,8 +539,15 @@ def loki_query():
         parse_logql_filter(query)
     )
 
-    start_time = int((time.time() - 3600) * 1000)
-    end_time = int(time.time() * 1000)
+    # Respect the caller's `time` parameter; default to now.
+    if time_param:
+        try:
+            end_time = int(float(time_param) * 1000)
+        except (ValueError, TypeError):
+            end_time = int(time.time() * 1000)
+    else:
+        end_time = int(time.time() * 1000)
+    start_time = end_time - 3_600_000  # 1 hour look-back
 
     try:
         events = warehouse.get_logs(table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"), 

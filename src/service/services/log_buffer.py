@@ -139,13 +139,17 @@ class LogBuffer:
         """Actual logic to write logs to warehouse."""
         if self._warehouse and logs_to_write:
             try:
-                # Group logs by table
+                # Group logs by table — keep original dicts intact so a
+                # retry re-enqueue preserves _warehouse_table metadata.
                 table_groups = {}
                 for log in logs_to_write:
-                    table_name = log.pop("_warehouse_table", None)
+                    table_name = log.get("_warehouse_table", None)
                     if table_name not in table_groups:
                         table_groups[table_name] = []
-                    table_groups[table_name].append(log)
+                    # Strip routing key before persisting
+                    table_groups[table_name].append(
+                        {k: v for k, v in log.items() if k != "_warehouse_table"}
+                    )
                 
                 # Insert logs for each table group
                 for table_name, logs in table_groups.items():
@@ -247,25 +251,29 @@ class LogBuffer:
     ) -> List[Dict[str, Any]]:
         """Search logs in the current hot tier (memory buffer)."""
         with self._lock:
-            results = []
-            for log in self._buffer:
-                # Cần xử lý data mapping tương ứng với metadata format
-                if log.get("log_group_name") != log_group_name:
+            snapshot = list(self._buffer)
+        results = []
+        for log in snapshot:
+            # Accept both snake_case (PutLogEvents path) and camelCase (ingest/loki path)
+            lg = log.get("log_group_name") or log.get("logGroupName", "")
+            if lg != log_group_name:
+                continue
+
+            if log_stream_name:
+                ls = log.get("log_stream_name") or log.get("logStreamName", "")
+                if ls != log_stream_name:
                     continue
-                
-                if log_stream_name and log.get("log_stream_name") != log_stream_name:
-                    continue
-                
-                ts = log.get("timestamp")
-                if start_time and ts < start_time:
-                    continue
-                if end_time and ts > end_time:
-                    continue
-                
-                results.append(log)
-                
-            results.sort(key=lambda x: x.get("timestamp", 0))
-            return results[:limit]
+
+            ts = log.get("timestamp")
+            if start_time and ts is not None and ts < start_time:
+                continue
+            if end_time and ts is not None and ts > end_time:
+                continue
+
+            results.append(log)
+
+        results.sort(key=lambda x: x.get("timestamp", 0))
+        return results[:limit]
 
     def get_log_groups(self) -> Dict[str, Dict[str, Any]]:
         """Get distinct log groups from buffer and their metadata."""

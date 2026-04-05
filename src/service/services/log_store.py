@@ -67,32 +67,28 @@ class LogStore:
         limit: int = 100,
     ) -> List[Dict]:
         key_prefix = f"{log_group_name}/"
+        # Snapshot the relevant event lists under the lock; filter outside.
         with self._lock:
-            events = []
+            streams_snapshot = {}
             for key, data in self._store.items():
                 if log_stream_name:
-                    full_key = f"{log_group_name}/{log_stream_name}"
-                    if key != full_key:
+                    if key != f"{log_group_name}/{log_stream_name}":
                         continue
                 elif not key.startswith(key_prefix):
                     continue
+                streams_snapshot[key] = list(data.get("events", []))
 
-                entry_events = data.get("events", [])
-                filtered = entry_events
+        events = []
+        for entry_events in streams_snapshot.values():
+            filtered = entry_events
+            if start_time:
+                filtered = [e for e in filtered if e.get("timestamp", 0) >= start_time]
+            if end_time:
+                filtered = [e for e in filtered if e.get("timestamp", 0) <= end_time]
+            events.extend(filtered)
 
-                if start_time:
-                    filtered = [
-                        e for e in filtered if e.get("timestamp", 0) >= start_time
-                    ]
-                if end_time:
-                    filtered = [
-                        e for e in filtered if e.get("timestamp", 0) <= end_time
-                    ]
-
-                events.extend(filtered)
-
-            events.sort(key=lambda x: x.get("timestamp", 0))
-            return events[:limit]
+        events.sort(key=lambda x: x.get("timestamp", 0))
+        return events[:limit]
 
     def filter_events(
         self,
@@ -106,40 +102,33 @@ class LogStore:
         from service.utils.helpers import parse_filter_pattern
 
         key_prefix = f"{log_group_name}/"
+        # Snapshot under lock; filter outside to minimise lock hold time.
         with self._lock:
-            events = []
+            streams_snapshot = {}
             for key, data in self._store.items():
                 if not key.startswith(key_prefix):
                     continue
+                stream_name = key.replace(key_prefix, "")
+                if log_stream_name_prefix and not stream_name.startswith(log_stream_name_prefix):
+                    continue
+                streams_snapshot[key] = list(data.get("events", []))
 
-                if log_stream_name_prefix:
-                    stream_name = key.replace(key_prefix, "")
-                    if not stream_name.startswith(log_stream_name_prefix):
-                        continue
+        events = []
+        for entry_events in streams_snapshot.values():
+            filtered = entry_events
+            if start_time:
+                filtered = [e for e in filtered if e.get("timestamp", 0) >= start_time]
+            if end_time:
+                filtered = [e for e in filtered if e.get("timestamp", 0) <= end_time]
+            if filter_pattern:
+                filtered = [
+                    e for e in filtered
+                    if parse_filter_pattern(filter_pattern, e.get("message", ""))
+                ]
+            events.extend(filtered)
 
-                entry_events = data.get("events", [])
-                filtered = entry_events
-
-                if start_time:
-                    filtered = [
-                        e for e in filtered if e.get("timestamp", 0) >= start_time
-                    ]
-                if end_time:
-                    filtered = [
-                        e for e in filtered if e.get("timestamp", 0) <= end_time
-                    ]
-
-                if filter_pattern:
-                    filtered = [
-                        e
-                        for e in filtered
-                        if parse_filter_pattern(filter_pattern, e.get("message", ""))
-                    ]
-
-                events.extend(filtered)
-
-            events.sort(key=lambda x: x.get("timestamp", 0))
-            return events[:limit]
+        events.sort(key=lambda x: x.get("timestamp", 0))
+        return events[:limit]
 
     def get_all_log_groups(self) -> Dict[str, Dict]:
         with self._lock:

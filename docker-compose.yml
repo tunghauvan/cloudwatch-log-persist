@@ -48,7 +48,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    command: ["python", "-m", "flask", "--app", "service.server", "run", "--host", "0.0.0.0", "--port", "4588"]
+    command: ["gunicorn", "--workers", "1", "--threads", "8", "--worker-class", "gthread", "--bind", "0.0.0.0:4588", "--timeout", "120", "--access-logfile", "-", "service.server:app"]
 
   minio:
     image: minio/minio

@@ -147,7 +147,17 @@ class WarehouseManager:
         self._wal_flush_thread: Optional[threading.Thread] = None   # WAL → cold, runs faster
         self._retention_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._staging_lock = threading.Lock()  # serialise staging writes
+        # Two fine-grained locks replace the former single _staging_lock:
+        #   _wal_write_lock  – protects WAL file creation/listing/deletion
+        #   _cold_lock       – protects cold-Iceberg writes and cold→S3 upload
+        # Separating them ensures that ingest (WAL writes) is never blocked by a
+        # slow Phase-2 S3 upload running in the compaction thread.
+        self._wal_write_lock = threading.Lock()
+        self._cold_lock = threading.Lock()
+        # In-memory WAL row counters.  Lazy-initialised on first access (one
+        # file-scan per table per process lifetime) and maintained via
+        # increment/decrement, making the per-write backpressure check O(1).
+        self._wal_row_counters: Dict[str, int] = {}
         # TTL caches for metadata queries (avoid full table scans on every list call)
         self._log_groups_cache: Optional[dict] = None
         self._log_groups_cache_time: float = 0.0
@@ -213,8 +223,15 @@ class WarehouseManager:
         return d
 
     def _wal_row_count(self, table_name: str) -> int:
+        # Fast path: counter already initialised for this table.
+        with self._wal_write_lock:
+            if table_name in self._wal_row_counters:
+                return self._wal_row_counters[table_name]
+        # First call: scan WAL files once to seed the counter.
         d = self.local_staging_dir / table_name / "wal"
         if not d.exists():
+            with self._wal_write_lock:
+                self._wal_row_counters[table_name] = 0
             return 0
         count = 0
         for f in d.glob("wal_*.jsonl"):
@@ -223,6 +240,12 @@ class WarehouseManager:
                     count += sum(1 for line in fp if line.strip())
             except Exception:
                 pass
+        with self._wal_write_lock:
+            # Another thread may have already seeded it; take the max to avoid
+            # losing rows counted between the scan and this moment.
+            self._wal_row_counters[table_name] = max(
+                count, self._wal_row_counters.get(table_name, 0)
+            )
         return count
 
     # ------------------------------------------------------------------
@@ -289,12 +312,16 @@ class WarehouseManager:
             self.cold_catalog.load_table(table_id)
         except Exception:
             cold_data_dir = self.local_staging_dir / "cold"
-            self.cold_catalog.create_table(
-                table_id,
-                schema=self._get_schema(),
-                partition_spec=self._get_partition_spec(),
-                location=str(cold_data_dir / table_name),
-            )
+            try:
+                self.cold_catalog.create_table(
+                    table_id,
+                    schema=self._get_schema(),
+                    partition_spec=self._get_partition_spec(),
+                    location=str(cold_data_dir / table_name),
+                )
+            except Exception:
+                # Concurrent callers may have already created the table.
+                pass
 
     def _cold_row_count(self, table_name: str) -> int:
         try:
@@ -430,6 +457,12 @@ class WarehouseManager:
         local Iceberg (cold), then delete each WAL file.  Idempotent.
 
         Memory cost: at most WAL_FLUSH_BATCH rows in RAM at a time.
+
+        Lock discipline:
+        - _wal_write_lock: held briefly to snapshot the file list, then again
+          to delete each processed file and update the row counter.
+        - _cold_lock: held only during cold-Iceberg appends (not during WAL
+          file reads or deletions), so concurrent ingest is never blocked.
         """
         import json
         target = table_name or self.table_name
@@ -438,50 +471,57 @@ class WarehouseManager:
             return 0
 
         # Rows to accumulate in memory before a single cold-Iceberg append.
-        # Smaller = less peak RAM; larger = fewer round-trips.
         WAL_FLUSH_BATCH = 10_000
 
-        with self._staging_lock:
+        # Snapshot the file list while holding the WAL lock (O(1) metadata op).
+        with self._wal_write_lock:
             wal_files = sorted(wal_dir.glob("wal_*.jsonl"))
             if not wal_files:
                 return 0
 
-            self._ensure_cold_table(target)
-            cold_tbl = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{target}")
+        self._ensure_cold_table(target)
 
-            flushed = 0
-            pending: list = []
+        flushed = 0
+        pending: list = []
 
-            def _flush_pending():
-                nonlocal flushed
-                if not pending:
-                    return
-                arrow_batch = self._logs_to_arrow(pending)
+        def _flush_pending():
+            nonlocal flushed
+            if not pending:
+                return
+            arrow_batch = self._logs_to_arrow(pending)
+            with self._cold_lock:
+                cold_tbl = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{target}")
                 cold_tbl.append(arrow_batch)
-                flushed += len(pending)
-                pending.clear()
+            flushed += len(pending)
+            pending.clear()
 
-            for f in wal_files:
-                try:
-                    with open(f) as fp:
-                        for line in fp:
-                            line = line.strip()
-                            if line:
-                                pending.append(json.loads(line))
-                                if len(pending) >= WAL_FLUSH_BATCH:
-                                    _flush_pending()
-                except Exception as e:
-                    logger.warning(f"[WAL] Could not read {f}: {e}")
+        for f in wal_files:
+            try:
+                with open(f) as fp:
+                    for line in fp:
+                        line = line.strip()
+                        if line:
+                            pending.append(json.loads(line))
+                            if len(pending) >= WAL_FLUSH_BATCH:
+                                _flush_pending()
+            except Exception as e:
+                logger.warning(f"[WAL] Could not read {f}: {e}")
 
-                # flush after finishing each file so we can delete it immediately
-                _flush_pending()
+            # flush after finishing each file so we can delete it immediately
+            _flush_pending()
 
+            with self._wal_write_lock:
                 try:
                     f.unlink()
                 except Exception:
                     pass
 
+        # Decrement the WAL row counter by the number of rows successfully flushed.
         if flushed:
+            with self._wal_write_lock:
+                self._wal_row_counters[target] = max(
+                    0, self._wal_row_counters.get(target, 0) - flushed
+                )
             logger.info(f"[WAL] Flushed {flushed} rows → cold Iceberg for '{target}'")
         return flushed
 
@@ -810,14 +850,23 @@ class WarehouseManager:
         # flush_wal() moves WAL → cold Iceberg; compact() moves cold → S3 Iceberg.
         import json
         import uuid
-        with self._staging_lock:
+        with self._wal_write_lock:
             wal_dir = self._wal_dir(target_table_name)
             ts_ms = int(time.time() * 1000)
             wal_file = wal_dir / f"wal_{ts_ms}_{uuid.uuid4().hex[:8]}.jsonl"
             with wal_file.open("w") as fh:
                 for log in logs:
                     fh.write(json.dumps(log, default=str) + "\n")
-            staging_rows = self._staging_table_row_count(target_table_name)
+            # Maintain in-memory counter (O(1) — avoids per-write file scan).
+            # Read the updated value while still holding the lock so we can use
+            # it for logging below without a second lock acquisition.
+            new_wal_count = self._wal_row_counters.get(target_table_name, 0) + len(logs)
+            self._wal_row_counters[target_table_name] = new_wal_count
+
+        # Compute staging_rows for logging: use the counter we just read + cold metadata.
+        # _cold_row_count() does NOT need _wal_write_lock so no deadlock risk.
+        cold_count = self._cold_row_count(target_table_name)
+        staging_rows = new_wal_count + cold_count
 
         logger.info(
             f" Staged {len(logs)} logs for '{target_table_name}' "
@@ -1208,7 +1257,7 @@ class WarehouseManager:
             SORT_BATCH = 50_000   # rows per sort-buffer chunk
 
             if cold_rows > 0:
-                with self._staging_lock:
+                with self._cold_lock:
                     try:
                         cold_tbl   = self.cold_catalog.load_table(cold_table_id)
                         s3_tbl_obj = self.catalog.load_table(s3_table_id)
@@ -1415,7 +1464,13 @@ class WarehouseManager:
                     archive_files = sum(
                         m.existing_files_count + m.added_files_count for m in manifests
                     )
-                    archive_rows = table.scan().to_arrow().num_rows
+                    # Use snapshot summary metadata — zero RAM, zero S3 I/O.
+                    summary = snapshot.summary
+                    if summary and "total-records" in summary.additional_properties:
+                        archive_rows = int(summary.additional_properties["total-records"])
+                    else:
+                        # Fallback: aggregate from manifest entry counts (still no data read)
+                        archive_rows = archive_files  # rough lower-bound; better than full scan
             except Exception:
                 pass
 
