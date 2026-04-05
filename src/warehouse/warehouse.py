@@ -889,11 +889,14 @@ class WarehouseManager:
             elif filter_expr:
                 scan = scan.filter(filter_expr)
 
+            # Hard cap per tier — prevents OOM on long time-range queries (e.g. 24 h).
+            # Even without an explicit limit, never materialise more than MAX_SCAN_ROWS
+            # rows per tier; after merge+sort the result is still sliced to `limit`.
+            MAX_SCAN_ROWS = 500_000
+            effective_limit = limit if (limit and limit > 0) else MAX_SCAN_ROWS
+
             # Use batch reader for early stop — avoids downloading all S3 files into RAM
-            if limit and limit > 0:
-                s3_result = self._scan_to_arrow_with_limit(scan, limit)
-            else:
-                s3_result = scan.to_arrow()
+            s3_result = self._scan_to_arrow_with_limit(scan, effective_limit)
 
             # Also read local staging Parquet files so data is visible before compaction.
             import pyarrow as pa
@@ -909,7 +912,7 @@ class WarehouseManager:
                     cold_scan = cold_scan.filter(filter_expression)
                 elif filter_expr:
                     cold_scan = cold_scan.filter(filter_expr)
-                cold_data = cold_scan.to_arrow()
+                cold_data = self._scan_to_arrow_with_limit(cold_scan, effective_limit)
                 if cold_data.num_rows > 0:
                     cold_result = cold_data
             except Exception as cold_err:
@@ -924,7 +927,8 @@ class WarehouseManager:
                 # Cap WAL rows read per query to avoid OOM when WAL is large.
                 # We read the newest files first (reverse sort) so recent data is
                 # always visible even when older files push past the cap.
-                wal_cap = max(limit * 10, 10_000) if limit else 50_000
+                # Never exceed 100k from WAL — hot tier shouldn't hold huge datasets.
+                wal_cap = min(max(effective_limit, 10_000), 100_000)
                 if wal_dir.exists():
                     for f in sorted(wal_dir.glob("wal_*.jsonl"), reverse=True):
                         if len(wal_logs) >= wal_cap:
