@@ -9,6 +9,10 @@ from typing import Dict, List, Any, Optional
 
 
 class LogStore:
+    # Keep at most this many events per stream in memory.
+    # Older events are evicted once the limit is reached.
+    MAX_EVENTS_PER_STREAM = 10_000
+
     def __init__(self):
         self._store: Dict[str, Dict[str, Any]] = {}
         self._sequence_tokens: Dict[str, int] = {}
@@ -40,6 +44,11 @@ class LogStore:
                         "ingestionTime": ingestion_time,
                     }
                 )
+
+            # Evict oldest events if the per-stream limit is exceeded
+            ev = self._store[key]["events"]
+            if len(ev) > self.MAX_EVENTS_PER_STREAM:
+                del ev[: len(ev) - self.MAX_EVENTS_PER_STREAM]
 
             new_sequence = self._sequence_tokens[key] + len(events)
             self._sequence_tokens[key] = new_sequence

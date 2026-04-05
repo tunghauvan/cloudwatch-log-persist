@@ -130,6 +130,9 @@ class WarehouseManager:
         self.wal_max_rows = int(compaction_config.get("wal_max_rows", 500_000))
         # How often the dedicated WAL-flush thread moves WAL → cold (seconds)
         self._wal_flush_interval = int(compaction_config.get("wal_flush_interval_seconds", 30))
+        # Phase 3 (S3 in-place merge) reads one full partition into RAM.
+        # Disable on memory-constrained deployments; phases 1+2 are sufficient.
+        self.s3_merge_enabled = compaction_config.get("s3_merge_enabled", True)
 
         retention_config = self.config.get("retention", {})
         self.retention_days = retention_config.get("days", 7)
@@ -296,7 +299,18 @@ class WarehouseManager:
     def _cold_row_count(self, table_name: str) -> int:
         try:
             t = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{table_name}")
-            return t.scan().to_arrow().num_rows
+            snapshot = t.current_snapshot()
+            if snapshot is None:
+                return 0
+            # Read row count from snapshot summary metadata — zero RAM cost
+            summary = snapshot.summary
+            if summary and "total-records" in summary.additional_properties:
+                return int(summary.additional_properties["total-records"])
+            # Fallback: count via batch reader (still avoids a single giant allocation)
+            total = 0
+            for batch in t.scan().to_arrow_batch_reader():
+                total += batch.num_rows
+            return total
         except Exception:
             return 0
 
@@ -412,8 +426,10 @@ class WarehouseManager:
 
     def flush_wal(self, table_name=None):
         """
-        Hot → Cold: read WAL JSONL files, append to local Iceberg (cold), delete WAL files.
-        Idempotent — call from /flush endpoint and at the start of compact().
+        Hot → Cold: read WAL JSONL files in streaming batches and append to
+        local Iceberg (cold), then delete each WAL file.  Idempotent.
+
+        Memory cost: at most WAL_FLUSH_BATCH rows in RAM at a time.
         """
         import json
         target = table_name or self.table_name
@@ -421,40 +437,52 @@ class WarehouseManager:
         if not wal_dir.exists():
             return 0
 
+        # Rows to accumulate in memory before a single cold-Iceberg append.
+        # Smaller = less peak RAM; larger = fewer round-trips.
+        WAL_FLUSH_BATCH = 10_000
+
         with self._staging_lock:
             wal_files = sorted(wal_dir.glob("wal_*.jsonl"))
             if not wal_files:
                 return 0
 
-            logs = []
+            self._ensure_cold_table(target)
+            cold_tbl = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{target}")
+
+            flushed = 0
+            pending: list = []
+
+            def _flush_pending():
+                nonlocal flushed
+                if not pending:
+                    return
+                arrow_batch = self._logs_to_arrow(pending)
+                cold_tbl.append(arrow_batch)
+                flushed += len(pending)
+                pending.clear()
+
             for f in wal_files:
                 try:
                     with open(f) as fp:
                         for line in fp:
                             line = line.strip()
                             if line:
-                                logs.append(json.loads(line))
+                                pending.append(json.loads(line))
+                                if len(pending) >= WAL_FLUSH_BATCH:
+                                    _flush_pending()
                 except Exception as e:
                     logger.warning(f"[WAL] Could not read {f}: {e}")
 
-            flushed = len(logs)
-            if flushed == 0:
-                for f in wal_files:
-                    f.unlink(missing_ok=True)
-                return 0
+                # flush after finishing each file so we can delete it immediately
+                _flush_pending()
 
-            table = self._logs_to_arrow(logs)
-            self._ensure_cold_table(target)
-            cold_tbl = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{target}")
-            cold_tbl.append(table)
-
-            for f in wal_files:
                 try:
                     f.unlink()
                 except Exception:
                     pass
 
-        logger.info(f"[WAL] Flushed {flushed} rows → cold Iceberg for '{target}'")
+        if flushed:
+            logger.info(f"[WAL] Flushed {flushed} rows → cold Iceberg for '{target}'")
         return flushed
 
     @property
@@ -1132,10 +1160,14 @@ class WarehouseManager:
 
     def compact(self, table_name=None):
         """
-        3-tier compaction:
-          Phase 1 (hot \u2192 cold): flush WAL JSONL files \u2192 local Iceberg (cold).
-          Phase 2 (cold \u2192 archive): read cold Iceberg \u2192 sort \u2192 append to S3 Iceberg \u2192 drop cold.
-          Phase 3 (archive merge): optional in-place S3 per-partition overwrite when fragmented.
+        3-tier compaction — low-memory streaming variant.
+
+        Phase 1 (hot -> cold): flush WAL in 10k-row batches (see flush_wal).
+        Phase 2 (cold -> S3) : stream cold Iceberg via batch_reader -> sort in
+                               SORT_BATCH_SIZE chunks -> S3 append; drop cold after.
+        Phase 3 (S3 merge)  : only when data_files > S3_MERGE_THRESHOLD (4).
+                               Streams per-day-partition; never loads more than
+                               one partition into RAM at a time.
         """
         if not self.compaction_enabled:
             return {"status": "skipped", "reason": "Compaction is disabled in config"}
@@ -1143,8 +1175,8 @@ class WarehouseManager:
         if not PYICEBERG_AVAILABLE:
             return {"status": "skipped", "reason": "PyIceberg not available"}
 
-        target_table = table_name or self.table_name
-        s3_table_id = f"{self.namespace}.{target_table}"
+        target_table  = table_name or self.table_name
+        s3_table_id   = f"{self.namespace}.{target_table}"
         cold_table_id = f"{self.COLD_NAMESPACE}.{target_table}"
 
         try:
@@ -1152,65 +1184,101 @@ class WarehouseManager:
             import pyarrow as pa
             import pyarrow.compute as pc
 
-            # Phase 1: WAL \u2192 cold Iceberg
+            # ------------------------------------------------------------------
+            # Phase 1: WAL -> cold Iceberg (streamed, 10k rows / batch)
+            # ------------------------------------------------------------------
             wal_flushed = self.flush_wal(target_table)
-            logger.info(f"[Compaction] Phase 1 done: flushed {wal_flushed} WAL rows \u2192 cold for {target_table}")
+            logger.info(
+                f"[Compaction] Phase 1 done: flushed {wal_flushed} WAL rows -> cold for {target_table}"
+            )
 
-            # Phase 2: cold Iceberg \u2192 S3 Iceberg
-            cold_data = None
-            cold_rows = 0
-            with self._staging_lock:
-                try:
-                    self._ensure_cold_table(target_table)
-                    cold_tbl = self.cold_catalog.load_table(cold_table_id)
-                    cold_data = cold_tbl.scan().to_arrow()
-                    cold_rows = cold_data.num_rows if cold_data is not None else 0
-                except Exception as cold_err:
-                    logger.warning(f"[Compaction] Could not read cold for {target_table}: {cold_err}")
-                    cold_rows = 0
-
-            logger.info(f"[Compaction] Phase 2: {cold_rows} cold rows to push to S3 {s3_table_id}")
+            # ------------------------------------------------------------------
+            # Phase 2: cold Iceberg -> S3 (streaming batch reader, no full load)
+            # ------------------------------------------------------------------
+            cold_rows = self._cold_row_count(target_table)
+            logger.info(
+                f"[Compaction] Phase 2: {cold_rows} cold rows to push to S3 {s3_table_id}"
+            )
 
             rows_pushed = 0
-            if cold_data is not None and cold_data.num_rows > 0:
-                sort_idx = pc.sort_indices(cold_data, sort_keys=[("timestamp", "ascending")])
-                cold_data = cold_data.take(sort_idx)
+            SORT_BATCH = 50_000   # rows per sort-buffer chunk
 
-                s3_table_obj = self.catalog.load_table(s3_table_id)
-                s3_table_obj.append(cold_data)
-                rows_pushed = cold_data.num_rows
-                logger.info(f"[Compaction] Pushed {rows_pushed} rows to S3 {s3_table_id}")
-
-                # Drop cold table to free local disk
+            if cold_rows > 0:
                 with self._staging_lock:
                     try:
-                        self.cold_catalog.drop_table(cold_table_id)
-                        self._cold_catalog = None   # force re-open next time
-                        logger.info(f"[Compaction] Cleared cold Iceberg for {target_table}")
-                    except Exception as drop_err:
-                        logger.warning(f"[Compaction] Could not drop cold table: {drop_err}")
+                        cold_tbl   = self.cold_catalog.load_table(cold_table_id)
+                        s3_tbl_obj = self.catalog.load_table(s3_table_id)
 
-            # Phase 3: in-place S3 compaction if many fragments already exist
+                        pending: list = []
+                        pending_rows  = 0
+
+                        def _push_pending():
+                            nonlocal rows_pushed
+                            if not pending:
+                                return
+                            chunk = pa.concat_tables(pending, promote_options="default")
+                            pending.clear()
+                            idx = pc.sort_indices(chunk, sort_keys=[("timestamp", "ascending")])
+                            s3_tbl_obj.append(chunk.take(idx))
+                            rows_pushed += chunk.num_rows
+
+                        for rb in cold_tbl.scan().to_arrow_batch_reader():
+                            if rb.num_rows == 0:
+                                continue
+                            pending.append(pa.Table.from_batches([rb]))
+                            pending_rows += rb.num_rows
+                            if pending_rows >= SORT_BATCH:
+                                _push_pending()
+                                pending_rows = 0
+
+                        _push_pending()  # flush remainder
+                        logger.info(f"[Compaction] Pushed {rows_pushed} rows to S3 {s3_table_id}")
+
+                        # Drop cold table to free local disk + catalog rows
+                        try:
+                            self.cold_catalog.drop_table(cold_table_id)
+                            self._cold_catalog = None
+                            logger.info(f"[Compaction] Cleared cold Iceberg for {target_table}")
+                        except Exception as drop_err:
+                            logger.warning(f"[Compaction] Could not drop cold table: {drop_err}")
+
+                    except Exception as p2_err:
+                        logger.error(
+                            f"[Compaction] Phase 2 error: {type(p2_err).__name__}: {p2_err}"
+                        )
+
+            # ------------------------------------------------------------------
+            # Phase 3: S3 in-place merge — only when heavily fragmented
+            # Skip entirely when <= S3_MERGE_THRESHOLD data files (common case).
+            # Process one day-partition at a time; explicit del after overwrite.
+            # ------------------------------------------------------------------
+            S3_MERGE_THRESHOLD = 4   # data files before we bother merging
             s3_compacted = 0
             try:
-                s3_table_obj = self.catalog.load_table(s3_table_id)
-                snapshot = s3_table_obj.current_snapshot()
+                s3_tbl_obj = self.catalog.load_table(s3_table_id)
+                snapshot   = s3_tbl_obj.current_snapshot()
                 if snapshot is None:
-                    return {"status": "success", "rows_pushed_from_staging": rows_pushed, "rows_merged_on_s3": 0}
+                    return {
+                        "status": "success",
+                        "rows_pushed_from_staging": rows_pushed,
+                        "rows_merged_on_s3": 0,
+                    }
 
-                manifests = snapshot.manifests(s3_table_obj.io)
+                manifests = snapshot.manifests(s3_tbl_obj.io)
                 data_file_count = sum(
                     m.existing_files_count + m.added_files_count for m in manifests
                 )
                 logger.info(
-                    f"[Compaction] S3 table has ~{data_file_count} data files across {len(manifests)} manifests"
+                    f"[Compaction] S3 table has ~{data_file_count} data files"
+                    f" across {len(manifests)} manifests"
                 )
 
-                if data_file_count > 1:
-                    partition_days = set()
+                if self.s3_merge_enabled and data_file_count > S3_MERGE_THRESHOLD:
+                    # Collect unique partition day values (metadata only, no data)
+                    partition_days: set = set()
                     for manifest in manifests:
                         try:
-                            for entry in manifest.fetch_manifest_entry(s3_table_obj.io):
+                            for entry in manifest.fetch_manifest_entry(s3_tbl_obj.io):
                                 try:
                                     day_val = entry.data_file.partition[0]
                                     if day_val is not None:
@@ -1233,31 +1301,45 @@ class WarehouseManager:
                                     "ingestion_time >= '" + day_start.isoformat() + "'"
                                     " AND ingestion_time < '" + day_end.isoformat() + "'"
                                 )
-                                part_data = s3_table_obj.scan().filter(day_filter).to_arrow()
-                                if part_data.num_rows == 0:
+                                # Stream partition into memory (one day at a time)
+                                part_batches: list = []
+                                for rb in s3_tbl_obj.scan().filter(day_filter).to_arrow_batch_reader():
+                                    if rb.num_rows > 0:
+                                        part_batches.append(pa.Table.from_batches([rb]))
+                                if not part_batches:
                                     continue
+                                part_data = pa.concat_tables(part_batches, promote_options="default")
+                                del part_batches
                                 si = pc.sort_indices(part_data, sort_keys=[("timestamp", "ascending")])
-                                part_data = part_data.take(si)
-                                s3_table_obj.overwrite(part_data, overwrite_filter=day_filter)
+                                s3_tbl_obj.overwrite(part_data.take(si), overwrite_filter=day_filter)
                                 s3_compacted += part_data.num_rows
                                 logger.info(
                                     f"[Compaction] Merged partition day={day_val}: {part_data.num_rows} rows"
                                 )
+                                del part_data  # free ASAP before next partition
                             except Exception as part_err:
                                 logger.warning(f"[Compaction] Partition day={day_val}: {part_err}")
                     else:
-                        all_data = s3_table_obj.scan().to_arrow()
-                        if all_data.num_rows > 0:
+                        # No partitions — stream full table, sort, overwrite
+                        all_batches: list = []
+                        for rb in s3_tbl_obj.scan().to_arrow_batch_reader():
+                            if rb.num_rows > 0:
+                                all_batches.append(pa.Table.from_batches([rb]))
+                        if all_batches:
+                            all_data = pa.concat_tables(all_batches, promote_options="default")
+                            del all_batches
                             si = pc.sort_indices(all_data, sort_keys=[("timestamp", "ascending")])
-                            s3_table_obj.overwrite(all_data.take(si))
+                            s3_tbl_obj.overwrite(all_data.take(si))
                             s3_compacted = all_data.num_rows
+                            del all_data
 
             except Exception as s3_err:
                 logger.warning(f"[Compaction] S3 in-place compaction error: {s3_err}")
                 s3_compacted = 0
 
             logger.info(
-                f"[Compaction] Done for {s3_table_id}: pushed={rows_pushed} s3_merged={s3_compacted}"
+                f"[Compaction] Done for {s3_table_id}:"
+                f" pushed={rows_pushed} s3_merged={s3_compacted}"
             )
             return {
                 "status": "success",

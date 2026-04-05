@@ -399,6 +399,118 @@ def buffer_stats():
     return jsonify({"error": "buffer not initialized"})
 
 
+@app.route("/debug/memory", methods=["GET"])
+def debug_memory():
+    """
+    Memory breakdown endpoint — zero overhead when not called.
+
+    Query params:
+      top=N        - top N tracemalloc lines (default 20); pass 0 to skip
+      trace=1      - start tracemalloc NOW and take snapshot (adds ~50 MB overhead while active)
+      trace=stop   - stop tracemalloc and free its memory
+      reset=1      - clear tracemalloc traces after reading
+    """
+    import gc
+    import tracemalloc
+    import collections
+    import platform
+
+    top_n = int(request.args.get("top", 20))
+    trace = request.args.get("trace", "")
+    reset = request.args.get("reset", "0") == "1"
+
+    # --- 1. OS RSS via /proc (Linux) or resource module -------------------
+    rss_bytes  = 0
+    hwm_bytes  = 0
+    vmsize_bytes = 0
+    try:
+        with open("/proc/1/status") as f:  # PID 1 = the Flask process inside container
+            for line in f:
+                k, _, v = line.partition(":")
+                v = v.strip()
+                if k == "VmRSS":
+                    rss_bytes  = int(v.split()[0]) * 1024
+                elif k == "VmHWM":       # peak RSS ever reached
+                    hwm_bytes  = int(v.split()[0]) * 1024
+                elif k == "VmSize":
+                    vmsize_bytes = int(v.split()[0]) * 1024
+    except FileNotFoundError:
+        import resource, platform
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_bytes = rss_kb if platform.system() == "Linux" else rss_kb * 1024
+
+    # --- 2. tracemalloc (opt-in, no overhead unless requested) -----------
+    tm_info: dict = {"active": tracemalloc.is_tracing()}
+    top_allocators: list = []
+
+    if trace == "1" and not tracemalloc.is_tracing():
+        tracemalloc.start(10)  # 10 frames is enough, less overhead than 25
+        tm_info["started"] = True
+
+    if trace == "stop" and tracemalloc.is_tracing():
+        tracemalloc.stop()
+        tm_info["stopped"] = True
+
+    if tracemalloc.is_tracing() and top_n > 0:
+        snapshot = tracemalloc.take_snapshot()
+        if reset:
+            tracemalloc.clear_traces()
+        cur, peak = tracemalloc.get_traced_memory()
+        tm_info["current_mb"] = round(cur  / 1024 / 1024, 1)
+        tm_info["peak_mb"]    = round(peak / 1024 / 1024, 1)
+
+        for s in snapshot.statistics("filename")[:top_n]:
+            top_allocators.append({
+                "size_kb":  round(s.size / 1024, 1),
+                "count":    s.count,
+                "location": s.traceback.format()[0].strip(),
+            })
+
+    # --- 3. GC object counts (cheap — no size traversal) -----------------
+    gc.collect()
+    type_counts: dict = collections.Counter()
+    for obj in gc.get_objects():
+        type_counts[type(obj).__name__] += 1
+    top_types = [{"type": t, "count": c} for t, c in type_counts.most_common(20)]
+
+    # --- 4. Application-level memory consumers ---------------------------
+    app_stats: dict = {}
+    if log_buffer:
+        app_stats["log_buffer_items"] = log_buffer.size()
+        app_stats["log_buffer_queue"] = log_buffer._flush_queue.qsize()
+
+    try:
+        from service.services.log_store import log_store
+        all_data = log_store.get_all()
+        total_events = sum(len(v.get("events", [])) for v in all_data.values())
+        app_stats["log_store_streams"] = len(all_data)
+        app_stats["log_store_events"]  = total_events
+    except Exception:
+        pass
+
+    if warehouse:
+        try:
+            ws = warehouse.get_stats()
+            app_stats["warehouse_wal"]         = ws.get("hot_wal", {})
+            app_stats["warehouse_cold"]        = ws.get("cold", {})
+            app_stats["warehouse_backpressure"] = ws.get("backpressure", {})
+        except Exception:
+            pass
+
+    return jsonify({
+        "process": {
+            "rss_mb":         round(rss_bytes    / 1024 / 1024, 1),
+            "peak_rss_mb":    round(hwm_bytes    / 1024 / 1024, 1),
+            "virtual_mb":     round(vmsize_bytes / 1024 / 1024, 1),
+            "uptime_seconds": round(time.time() - startup_time, 0),
+        },
+        "tracemalloc": tm_info,
+        "top_allocators": top_allocators,
+        "top_gc_types":   top_types,
+        "app":            app_stats,
+    })
+
+
 @app.route("/warehouse/stats", methods=["GET"])
 def warehouse_stats():
     """3-tier health: hot WAL, cold Iceberg, archive S3."""
