@@ -76,3 +76,12 @@ ingest:
       - container
       - level
       - namespace
+
+alb:
+  enabled: true
+  table_name: alb_logs
+  batch_size: 10000
+  # SQS (future) — leave blank when testing via /alb/s3-event
+  sqs_queue_url: ""
+  sqs_visibility_timeout: 60
+  sqs_max_messages: 5

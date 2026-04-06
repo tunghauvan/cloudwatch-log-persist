@@ -182,45 +182,73 @@ def convert_timestamp_to_ns(timestamp):
         return str(int(timestamp) * 1000000)
 
 
+def _parse_logfmt_message(line: str):
+    """Parse a logfmt / key_value formatted log line.
+
+    Detects lines that look like: key="value" key2="value2" ...
+    Returns {"message": <actual message>, "labels": {other_key: value, ...}}
+    or None if the line doesn't look like logfmt.
+    """
+    if not line or '="' not in line:
+        return None
+
+    # Quick heuristic: at least 2 key="value" pairs → likely logfmt
+    kv_pattern = re.compile(r'(\S+?)="((?:[^"\\]|\\.)*)"')
+    pairs = kv_pattern.findall(line)
+    if len(pairs) < 2:
+        return None
+
+    fields = {}
+    for key, value in pairs:
+        # Unescape common escapes
+        value = value.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+        fields[key] = value
+
+    # The actual log message: prefer "message", fall back to "log", then "msg"
+    message = fields.pop("message", None) or fields.pop("log", None) or fields.pop("msg", None) or line
+    # Remove time/timestamp since we already have a proper timestamp
+    fields.pop("time", None)
+    fields.pop("timestamp", None)
+
+    return {"message": message, "labels": fields}
+
+
 def logs_to_loki_streams(logs):
-    """Convert logs to Loki streams format optimized for speed."""
+    """Convert logs to Loki streams format.
+    Each log entry is its own stream so that 'message' appears as a named field
+    alongside all other stream labels (app, pod, namespace, etc.).
+    """
     if not logs:
         return []
-    
-    streams = defaultdict(lambda: {"stream": {}, "values": []})
-    
+
+    result = []
     for log in logs:
-        # Build labels dict with only non-empty values
+        message = log.get("message", "")
+
         labels = {
             "log_group": log.get("logGroupName", "default"),
             "log_stream": log.get("logStreamName", "default"),
         }
-        
-        # Add optional labels if present and non-empty
-        if log.get("label_env"):
-            labels["env"] = log["label_env"]
-        if log.get("label_service"):
-            labels["service"] = log["label_service"]
-            labels["service_name"] = log["label_service"]
-        if log.get("label_host"):
-            labels["host"] = log["label_host"]
-        if log.get("label_region"):
-            labels["region"] = log["label_region"]
-        
-        label_key = tuple(sorted(labels.items()))
-        
-        # Initialize stream if first time
-        if not streams[label_key]["stream"]:
-            streams[label_key]["stream"] = dict(labels)
-        
-        # Get timestamp and convert to nanoseconds
+
+        # Add ALL label_* fields dynamically
+        for k, v in log.items():
+            if k.startswith("label_") and v:
+                label_name = k[6:]  # strip "label_" prefix
+                labels[label_name] = v
+                # Also expose service_name alias when service is present
+                if label_name == "service":
+                    labels["service_name"] = v
+
+        # Include message as a named stream field so it appears alongside other labels
+        if message:
+            labels["message"] = message
+
         timestamp = log.get("timestamp", log.get("ingestionTime", int(time.time() * 1000)))
         timestamp_ns = convert_timestamp_to_ns(timestamp)
-        
-        # Append [timestamp, message] pair
-        streams[label_key]["values"].append([timestamp_ns, log.get("message", "")])
-    
-    return list(streams.values())
+
+        result.append({"stream": labels, "values": [[timestamp_ns, message]]})
+
+    return result
 
 
 @loki_bp.route("/loki/api/v1/push", methods=["POST"])
@@ -294,6 +322,15 @@ def loki_push():
             timestamp_us = int(int(timestamp_ns) / 1000)
             total_logs += 1
 
+            # Parse key_value (logfmt) formatted log lines from Fluent Bit.
+            # e.g. time="..." message="actual log" pod_id="..." host="..."
+            # Extract the real message and promote other kv pairs to labels.
+            extra_labels = {}
+            parsed_message = _parse_logfmt_message(message)
+            if parsed_message is not None:
+                extra_labels = parsed_message["labels"]
+                message = parsed_message["message"]
+
             log_entry = {
                 "logGroupName": log_group,
                 "logStreamName": log_stream,
@@ -308,6 +345,13 @@ def loki_push():
             for k, v in labels_str.items():
                 safe_key = k.replace("-", "_").replace(" ", "_")
                 log_entry[f"label_{safe_key}"] = v
+
+            # Merge extra labels extracted from logfmt line (lower priority than stream labels)
+            for k, v in extra_labels.items():
+                safe_key = k.replace("-", "_").replace(".", "_").replace(" ", "_")
+                label_key = f"label_{safe_key}"
+                if label_key not in log_entry:
+                    log_entry[label_key] = v
 
             # Auto mapping alias: pod -> logStreamName, namespace -> logGroupName if needed
             if "pod" in labels_str and log_stream == "default":
@@ -582,19 +626,18 @@ def loki_query():
 
     logs = []
     for e in filtered_events:
-        logs.append(
-            {
-                "timestamp": e.get("timestamp", 0),
-                "message": e.get("message", ""),
-                "ingestionTime": e.get("ingestionTime", 0),
-                "logGroupName": e.get("logGroupName", "default"),
-                "logStreamName": e.get("logStreamName", "default"),
-                "label_env": e.get("label_env", ""),
-                "label_service": e.get("label_service", ""),
-                "label_host": e.get("label_host", ""),
-                "label_region": e.get("label_region", ""),
-            }
-        )
+        log_entry = {
+            "timestamp": e.get("timestamp", 0),
+            "message": e.get("message", ""),
+            "ingestionTime": e.get("ingestionTime", 0),
+            "logGroupName": e.get("logGroupName", "default"),
+            "logStreamName": e.get("logStreamName", "default"),
+        }
+        # Pass ALL label_* fields so logs_to_loki_streams includes them as stream labels
+        for k, v in e.items():
+            if k.startswith("label_") and v:
+                log_entry[k] = v
+        logs.append(log_entry)
 
     streams = logs_to_loki_streams(logs)
 
@@ -927,20 +970,20 @@ def loki_query_range():
     filtered_events = filtered_events[:limit]
 
     # Regular log query - return streams
-    logs = [
-        {
+    logs = []
+    for e in filtered_events:
+        log_entry = {
             "timestamp": e.get("timestamp", 0),
             "message": e.get("message", ""),
             "ingestionTime": e.get("ingestionTime", 0),
             "logGroupName": e.get("logGroupName", "default"),
             "logStreamName": e.get("logStreamName", "default"),
-            "label_env": e.get("label_env", ""),
-            "label_service": e.get("label_service", ""),
-            "label_host": e.get("label_host", ""),
-            "label_region": e.get("label_region", ""),
         }
-        for e in filtered_events
-    ]
+        # Pass ALL label_* fields so logs_to_loki_streams includes them as stream labels
+        for k, v in e.items():
+            if k.startswith("label_") and v:
+                log_entry[k] = v
+        logs.append(log_entry)
 
     streams = logs_to_loki_streams(logs)
 

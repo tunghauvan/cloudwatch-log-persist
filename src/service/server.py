@@ -14,6 +14,7 @@ from service.routes.store import store_bp
 from service.routes.ingest import ingest_bp
 from service.routes.loki import loki_bp
 from service.routes.metrics import metrics_bp
+from service.routes.alb import alb_bp
 from service.utils.logging_config import setup_logging
 
 logger = setup_logging()
@@ -74,6 +75,7 @@ app.register_blueprint(store_bp)
 app.register_blueprint(ingest_bp)
 app.register_blueprint(loki_bp)
 app.register_blueprint(metrics_bp)
+app.register_blueprint(alb_bp)
 
 
 @app.route("/", methods=["GET"])
