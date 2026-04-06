@@ -66,7 +66,11 @@ class SparkManager:
         user = db_config.get("user", "admin")
         password = db_config.get("password", "admin123")
 
-        return {
+        s3_config = self.config.get("s3", {})
+        use_ec2_role = s3_config.get("use_ec2_role", False)
+        endpoint = s3_config.get("endpoint", "http://localhost:9000")
+        
+        config_dict = {
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
             "spark.sql.catalog.spark_catalog": "org.apache.iceberg.spark.SparkCatalog",
             "spark.sql.catalog.spark_catalog.type": "sql",
@@ -74,17 +78,30 @@ class SparkManager:
             "spark.sql.warehouse.dir": self.warehouse_path,
             "spark.local.dir": "/tmp/spark",
             # S3A Configuration
-            "spark.hadoop.fs.s3a.endpoint": self.config.get("s3", {}).get("endpoint", "http://localhost:9000"),
-            "spark.hadoop.fs.s3a.access.key": self.config.get("s3", {}).get("access_key", "admin"),
-            "spark.hadoop.fs.s3a.secret.key": self.config.get("s3", {}).get("secret_key", "admin123"),
+            "spark.hadoop.fs.s3a.endpoint": endpoint,
             "spark.hadoop.fs.s3a.path.style.access": "true",
             "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
-            "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
             "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
             # S3A timeout settings (in milliseconds to avoid parsing issues)
             "spark.hadoop.fs.s3a.connection.timeout": "60000",  # 60 seconds in ms
             "spark.hadoop.fs.s3a.socket.timeout": "60000",      # 60 seconds in ms
         }
+        
+        # Configure credentials based on whether EC2 role is enabled
+        if use_ec2_role:
+            # Use EC2 instance profile credentials
+            config_dict["spark.hadoop.fs.s3a.aws.credentials.provider"] = (
+                "org.apache.hadoop.fs.s3a.auth.IAMInstanceProfileCredentialsProvider"
+            )
+        else:
+            # Use explicit static credentials
+            config_dict["spark.hadoop.fs.s3a.access.key"] = s3_config.get("access_key", "admin")
+            config_dict["spark.hadoop.fs.s3a.secret.key"] = s3_config.get("secret_key", "admin123")
+            config_dict["spark.hadoop.fs.s3a.aws.credentials.provider"] = (
+                "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+            )
+        
+        return config_dict
 
 
     def get_spark(self) -> SparkSession:
@@ -199,6 +216,66 @@ class WarehouseManager:
         if path.startswith("file://"):
             return Path(path.replace("file://", ""))
         return Path(path)
+
+    def _build_s3_client_config(self) -> dict:
+        """
+        Build boto3 S3 client configuration supporting both explicit credentials and EC2 role.
+        
+        If s3.use_ec2_role is True, credentials are obtained from the EC2 instance's IAM role.
+        Otherwise, explicit access_key and secret_key are used.
+        
+        Returns: dict of kwargs to pass to boto3.client("s3", **config)
+        """
+        s3_config = self.config.get("s3", {})
+        use_ec2_role = s3_config.get("use_ec2_role", False)
+        endpoint_url = s3_config.get("endpoint", "http://localhost:9000")
+        region = s3_config.get("region", "us-east-1")
+        
+        client_kwargs = {
+            "region_name": region,
+        }
+        
+        # Only add endpoint if specified (standard AWS doesn't use custom endpoints)
+
+        
+        # Add credentials only if not using EC2 role
+        if not use_ec2_role:
+            access_key = s3_config.get("access_key", "admin")
+            secret_key = s3_config.get("secret_key", "admin123")
+            client_kwargs["aws_access_key_id"] = access_key
+            client_kwargs["aws_secret_access_key"] = secret_key
+            if endpoint_url:
+                client_kwargs["endpoint_url"] = endpoint_url
+                
+        return client_kwargs
+
+    def _build_s3_catalog_props(self) -> dict:
+        """
+        Build PyIceberg catalog properties for S3 supporting both explicit credentials and EC2 role.
+        
+        If s3.use_ec2_role is True, credentials are obtained from the EC2 instance's IAM role.
+        Otherwise, explicit s3.access-key-id and s3.secret-access-key are included.
+        
+        Returns: dict of S3-specific properties for PyIceberg catalog
+        """
+        s3_config = self.config.get("s3", {})
+        use_ec2_role = s3_config.get("use_ec2_role", False)
+        endpoint = s3_config.get("endpoint", "http://localhost:9000")
+        region = s3_config.get("region", "us-east-1")
+        
+        props = {
+            "s3.endpoint": endpoint,
+            "s3.region": region,
+        }
+        
+        # Add credentials only if not using EC2 role
+        if not use_ec2_role:
+            access_key = s3_config.get("access_key", "admin")
+            secret_key = s3_config.get("secret_key", "admin123")
+            props["s3.access-key-id"] = access_key
+            props["s3.secret-access-key"] = secret_key
+        
+        return props
 
     @property
     def warehouse_dir(self) -> Path:
@@ -544,15 +621,7 @@ class WarehouseManager:
                 }
 
                 if self.warehouse_path.startswith("s3"):
-                    s3_config = self.config.get("s3", {})
-                    catalog_props.update(
-                        {
-                            "s3.endpoint": s3_config.get("endpoint", "http://localhost:9000"),
-                            "s3.access-key-id": s3_config.get("access_key", "admin"),
-                            "s3.secret-access-key": s3_config.get("secret_key", "admin123"),
-                            "s3.region": s3_config.get("region", "us-east-1"),
-                        }
-                    )
+                    catalog_props.update(self._build_s3_catalog_props())
 
                 self._catalog = load_catalog("sql", **catalog_props)
             else:
@@ -1525,19 +1594,9 @@ class WarehouseManager:
             
             logger.info(f"[Metadata Cleanup] Starting for {self.namespace}.{self.table_name}")
             
-            s3_config = self.config.get("s3", {})
-            endpoint_url = s3_config.get("endpoint", "http://localhost:9000")
-            access_key = s3_config.get("access_key", "admin")
-            secret_key = s3_config.get("secret_key", "admin123")
             bucket = "warehouse"
             
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=endpoint_url,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                region_name="us-east-1"
-            )
+            s3 = boto3.client("s3", **self._build_s3_client_config())
             
             # List all metadata files
             prefix = f"{self.namespace}/{self.table_name}/metadata/"

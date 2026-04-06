@@ -54,3 +54,4 @@ Thumbs.db
 grafana_data/
 wal/
 compaction-test/
+helm/

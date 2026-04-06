@@ -1,13 +1,22 @@
-warehouse: s3a://warehouse/
+warehouse: s3a://stag-log-warehouse/
 catalog: postgresql
 namespace: default
 table_name: cloudwatch_logs
 
 s3:
   endpoint: http://minio:9000
+  region: ap-southeast-1
+  # Credentials: choose one of the two authentication methods below
+  # 
+  # Method 1: Explicit credentials (default)
+  # Used for local development or when static credentials are preferred
   access_key: admin
   secret_key: admin123
-  region: us-east-1
+  #
+  # Method 2: EC2 IAM Role (recommended for production AWS deployments)
+  # Set use_ec2_role to true to use the EC2 instance's attached IAM role
+  # When enabled, access_key and secret_key are ignored
+  use_ec2_role: false
 
 cloudwatch:
   endpoint_url: http://localhost:4588
