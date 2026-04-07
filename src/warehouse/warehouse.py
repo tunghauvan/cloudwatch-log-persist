@@ -1,3 +1,6 @@
+import ctypes
+import ctypes.util
+import gc
 import os
 import yaml
 import time
@@ -43,12 +46,9 @@ except ImportError as e:
     PYICEBERG_AVAILABLE = False
 
 try:
-    from pyspark.sql import SparkSession
-    from pyspark.sql.functions import col, dayofmonth, to_timestamp, lit
-
+    import pyspark  # lightweight check — actual SparkSession is lazy-loaded in SparkManager.get_spark()
     PYSPARK_AVAILABLE = True
-except ImportError as e:
-    logger.debug(f"PySpark import error: {e}")
+except ImportError:
     PYSPARK_AVAILABLE = False
 
 
@@ -56,7 +56,7 @@ class SparkManager:
     def __init__(self, config: Dict[str, Any], warehouse_path: str):
         self.config = config
         self.warehouse_path = warehouse_path
-        self._spark: Optional[SparkSession] = None
+        self._spark = None  # SparkSession, lazily initialised
 
     def _get_spark_config(self) -> Dict[str, str]:
         db_config = self.config.get("database", {})
@@ -104,8 +104,11 @@ class SparkManager:
         return config_dict
 
 
-    def get_spark(self) -> SparkSession:
+    def get_spark(self):
         if self._spark is None:
+            # Heavy import deferred until first actual Spark use (saves ~300 MB at startup)
+            from pyspark.sql import SparkSession
+
             builder = SparkSession.builder
             builder = builder.appName(
                 self.config.get("spark", {}).get("app_name", "CloudWatchLogPersist")
@@ -1781,21 +1784,52 @@ class WarehouseManager:
             logger.error(f"[Metadata Cleanup] Error: {e}")
             return {"status": "error", "message": str(e)}
 
+    @staticmethod
+    def _trim_memory():
+        """Return free pages to the OS after a compaction cycle.
+
+        PyArrow uses jemalloc/mimalloc as its C++ memory pool. After bulk
+        Arrow buffers are deleted Python releases the objects but the C++
+        allocator keeps the pages in its own free-list — RSS stays inflated.
+        Calling malloc_trim(0) on Linux forces glibc (and the jemalloc shim)
+        to punch-hole those empty pages back to the OS, visibly dropping RSS.
+        gc.collect() is called first to ensure all Python-level references are
+        dropped before we trim.
+        """
+        gc.collect()
+        try:
+            libc_name = ctypes.util.find_library("c")
+            if libc_name:
+                libc = ctypes.CDLL(libc_name)
+                if hasattr(libc, "malloc_trim"):
+                    libc.malloc_trim(0)
+        except Exception:
+            pass  # not available on macOS/Windows — silently skip
+
     def _compaction_loop(self):
-        """Flush cold \u2192 S3 every compaction_interval seconds. Run immediately on first tick."""
-        # Run once immediately so data written before the loop sleeps isn't stuck for 5 min
-        if not self._stop_event.is_set():
-            try:
-                self.compact(table_name=self.table_name)
-                self.compact(table_name=self.loki_table_name)
-            except Exception as e:
-                logger.warning(f"[Compaction] Initial run error: {e}")
+        """Flush cold → S3 every compaction_interval seconds.
+        Waits 60 s after startup before the first run so the JVM / PyArrow
+        allocators settle and the memory baseline is accurate.
+        """
+        # 60-second grace period: let the service finish initialising before
+        # the first heavy compaction (avoids a double RAM spike at boot).
+        if self._stop_event.wait(timeout=60):
+            return
+        try:
+            self.compact(table_name=self.table_name)
+            self.compact(table_name=self.loki_table_name)
+        except Exception as e:
+            logger.warning(f"[Compaction] Initial run error: {e}")
+        finally:
+            self._trim_memory()
         while not self._stop_event.wait(timeout=self.compaction_interval):
             try:
                 self.compact(table_name=self.table_name)
                 self.compact(table_name=self.loki_table_name)
             except Exception as e:
                 logger.warning(f"[Compaction] Loop error: {e}")
+            finally:
+                self._trim_memory()
 
     def _wal_flush_loop(self):
         """Flush WAL \u2192 cold Iceberg on a short interval (default 30s).\n        Keeps the WAL small and makes data available to Iceberg filter push-down sooner.\n        """
@@ -1823,11 +1857,15 @@ class WarehouseManager:
             self.compact_alb()
         except Exception as e:
             logger.warning(f"[ALB Compaction] Initial run error: {e}")
+        finally:
+            self._trim_memory()
         while not self._stop_event.wait(timeout=self.alb_compaction_interval):
             try:
                 self.compact_alb()
             except Exception as e:
                 logger.warning(f"[ALB Compaction] Loop error: {e}")
+            finally:
+                self._trim_memory()
 
     def _check_and_repair_catalog(self) -> bool:
         import psycopg2
