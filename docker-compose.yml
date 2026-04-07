@@ -112,7 +112,111 @@ services:
     command: ["sh", "-c", "pip install requests && python log-simulator.py"]
     restart: unless-stopped
 
+  superset-db:
+    image: postgres:15
+    container_name: superset-db
+    environment:
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+    volumes:
+      - superset_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  superset-redis:
+    image: redis:7-alpine
+    container_name: superset-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  superset-init:
+    build:
+      context: .
+      dockerfile: superset/Dockerfile
+    container_name: superset-init
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/init_warehouse.py:/app/pythonpath/init_warehouse.py:ro
+      - superset_home:/app/superset_home
+    environment:
+      - PYTHONPATH=/app/pythonpath
+      - SUPERSET_SECRET_KEY=your-secret-key-change-in-production
+      - SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://superset:superset@superset-db:5432/superset
+      - REDIS_HOST=superset-redis
+      - REDIS_PORT=6379
+      - MINIO_ENDPOINT=iceberg-minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=admin123
+      - MINIO_BUCKET=stag-log-warehouse
+    command:
+      - bash
+      - -c
+      - |
+        superset db upgrade &&
+        superset fab create-admin \
+          --username admin --firstname Admin --lastname User \
+          --email admin@example.com --password admin123 || true &&
+        superset fab reset-password --username admin --password admin123 &&
+        superset init &&
+        python /app/pythonpath/init_warehouse.py
+
+  superset:
+    build:
+      context: .
+      dockerfile: superset/Dockerfile
+    container_name: superset-app
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/init_warehouse.py:/app/pythonpath/init_warehouse.py:ro
+      - superset_home:/app/superset_home
+    environment:
+      - PYTHONPATH=/app/pythonpath
+      - SUPERSET_SECRET_KEY=your-secret-key-change-in-production
+      - SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://superset:superset@superset-db:5432/superset
+      - REDIS_HOST=superset-redis
+      - REDIS_PORT=6379
+      - MINIO_ENDPOINT=iceberg-minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=admin123
+      - MINIO_BUCKET=stag-log-warehouse
+    command:
+      - bash
+      - -c
+      - |
+        gunicorn --bind 0.0.0.0:8088 --workers 4 \
+          --worker-class gthread --threads 8 \
+          --timeout 120 --keep-alive 5 --max-requests 1000 \
+          'superset.app:create_app()'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   postgres_data:
   minio_data:
   staging_data:
+  superset_db_data:
+  superset_home:
