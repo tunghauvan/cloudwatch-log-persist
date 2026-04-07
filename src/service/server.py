@@ -531,6 +531,87 @@ def warehouse_stats():
     return jsonify(warehouse.get_stats())
 
 
+@app.route("/admin/gc", methods=["POST"])
+def admin_gc():
+    """
+    One-shot metadata garbage collection for all Iceberg tables.
+
+    What it does (per table):
+      1. Apply write properties: write.metadata.delete-after-commit, previous-versions-max,
+         write.target-file-size-bytes, compression-codec (idempotent — skipped if already set).
+      2. Expire snapshots older than the 2nd-most-recent one (keeps last 2 for rollback safety).
+      3. Delete orphaned Avro manifest/manifest-list files that are no longer
+         referenced by any surviving snapshot (S3 only; skipped for local FS).
+
+    Safe to call multiple times. Runs synchronously; typical duration < 10 s.
+
+    Usage (production Kubernetes):
+      kubectl exec -n <ns> <pod> -- curl -s -X POST http://localhost:4588/admin/gc
+    Or via port-forward from your laptop:
+      kubectl port-forward -n <ns> svc/<svc> 4588:4588
+      curl -s -X POST http://localhost:4588/admin/gc | python3 -m json.tool
+    """
+    wh = get_warehouse()
+    if not wh:
+        return jsonify({"error": "warehouse not available"}), 503
+
+    from datetime import datetime, timezone
+
+    DESIRED_PROPS = {
+        "write.target-file-size-bytes": "134217728",
+        "write.parquet.compression-codec": "snappy",
+        "write.metadata.delete-after-commit.enabled": "true",
+        "write.metadata.previous-versions-max": "3",
+    }
+
+    results = {}
+    tables = [wh.table_name, wh.loki_table_name]
+
+    for table_name in tables:
+        table_id = f"{wh.namespace}.{table_name}"
+        entry = {"table": table_id, "props_applied": [], "snapshots_expired": 0, "orphans_deleted": 0, "error": None}
+        results[table_name] = entry
+
+        try:
+            tbl = wh.catalog.load_table(table_id)
+        except Exception as e:
+            entry["error"] = f"load_table failed: {e}"
+            continue
+
+        # 1. Apply missing write properties
+        existing = tbl.properties if isinstance(tbl.properties, dict) else {}
+        missing = {k: v for k, v in DESIRED_PROPS.items() if k not in existing}
+        if missing:
+            try:
+                with tbl.transaction() as tx:
+                    tx.set_properties(**missing)
+                entry["props_applied"] = list(missing.keys())
+                tbl = wh.catalog.load_table(table_id)
+            except Exception as e:
+                entry["error"] = f"set_properties failed: {e}"
+                # continue — still try snapshot expiration
+
+        # 2. Expire old snapshots
+        try:
+            snaps = sorted(tbl.snapshots(), key=lambda s: s.timestamp_ms)
+            if len(snaps) > 2:
+                cutoff_ms = snaps[-2].timestamp_ms
+                cutoff_dt = datetime.fromtimestamp(cutoff_ms / 1000.0, tz=timezone.utc)
+                tbl.maintenance.expire_snapshots().older_than(cutoff_dt).commit()
+                entry["snapshots_expired"] = len(snaps) - 2
+                tbl = wh.catalog.load_table(table_id)
+        except Exception as e:
+            entry["error"] = (entry.get("error") or "") + f"; expire_snapshots: {e}"
+
+        # 3. GC orphaned Avro files in metadata/ on S3
+        try:
+            entry["orphans_deleted"] = wh._gc_metadata_orphans(tbl, table_name)
+        except Exception as e:
+            entry["error"] = (entry.get("error") or "") + f"; gc_orphans: {e}"
+
+    return jsonify({"status": "ok", "results": results})
+
+
 def shutdown():
     print("[Server] Shutting down...")
     if log_buffer:

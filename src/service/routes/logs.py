@@ -90,12 +90,14 @@ def put_log_events():
             events_to_buffer = []
             for event in log_events:
                 events_to_buffer.append({
-                    "log_group_name": log_group_name,
-                    "log_stream_name": log_stream_name,
+                    "logGroupName": log_group_name,
+                    "logStreamName": log_stream_name,
+                    # timestamp from CloudWatch API is already in ms; _logs_to_arrow
+                    # normalises any epoch scale so we pass it as-is.
                     "timestamp": event.get("timestamp"),
                     "message": event.get("message"),
-                    "ingestion_time": ingestion_time,
-                    "sequence_token": new_sequence
+                    "ingestionTime": ingestion_time,
+                    "sequenceToken": new_sequence,
                 })
             buffer.add(events_to_buffer)
             logger.info(f"[PutLogEvents] Added {len(events_to_buffer)} events to buffer, buffer size now: {buffer.size()}")

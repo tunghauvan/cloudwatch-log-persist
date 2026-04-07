@@ -43,38 +43,31 @@ FEATURE_FLAGS = {
 # DuckDB — engine-level initialisation applied to every new connection
 # ------------------------------------------------------------------
 # The alb_warehouse.duckdb file is created by superset/init_warehouse.py
-# which runs at container startup.  Superset opens it read-only so that
-# multiple gunicorn workers can query it concurrently without conflicts.
+# which persists extensions, S3 secret, and the alb_logs view.
+#
+# Two problems solved here:
+#   1. File lock: DuckDB 1.x takes an exclusive write lock when opened
+#      normally. Fix: open with read_only=True + config dict so multiple
+#      Gunicorn workers can query concurrently.
+#   2. Missing .connection: DuckDB 1.5 removed the .connection attribute
+#      on DuckDBPyConnection. Superset/SQLAlchemy accesses it. Fix: shim
+#      it by wrapping the connection class at import time.
 
-_DUCKDB_INIT_SQL = """
-INSTALL httpfs;
-LOAD httpfs;
-INSTALL iceberg;
-LOAD iceberg;
-SET unsafe_enable_version_guessing = true;
-"""
+import duckdb as _duckdb
+
+if not hasattr(_duckdb.DuckDBPyConnection, "connection"):
+    _duckdb.DuckDBPyConnection.connection = property(lambda self: self)
 
 
-def _duckdb_connect(uri):
+def DB_CONNECTION_MUTATOR(uri, params, username, security_manager, source):
     """
-    SQLAlchemy 'creator' callable used when a DuckDB engine is created.
-    Runs initialisation SQL on every new connection so extensions and
-    settings are always available regardless of the database file state.
+    Called by Superset before creating each SQLAlchemy engine.
+    For DuckDB databases: inject read_only + config so the file is opened
+    without an exclusive lock (allows concurrent Gunicorn workers).
     """
-    import duckdb
-
-    db_path = str(uri).replace("duckdb:///", "")
-    read_only = db_path != ":memory:"
-    conn = duckdb.connect(
-        db_path if db_path else ":memory:",
-        read_only=read_only,
-        config={"unsafe_enable_version_guessing": True},
-    )
-    for stmt in _DUCKDB_INIT_SQL.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            try:
-                conn.execute(stmt)
-            except Exception:
-                pass  # extension may already be loaded
-    return conn
+    if str(uri).startswith("duckdb"):
+        existing = params.get("connect_args", {})
+        existing.setdefault("read_only", True)
+        existing.setdefault("config", {"unsafe_enable_version_guessing": True})
+        params["connect_args"] = existing
+    return uri, params

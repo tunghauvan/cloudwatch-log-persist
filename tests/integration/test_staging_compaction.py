@@ -35,7 +35,6 @@ import pytest
 
 def _make_warehouse(tmp_path: Path):
     """Return a WarehouseManager backed by local FS + SQLite only."""
-    from unittest.mock import patch, mock_open
     import yaml
 
     warehouse_dir = tmp_path / "warehouse"
@@ -61,12 +60,6 @@ def _make_warehouse(tmp_path: Path):
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.dump(cfg))
-
-    # patch warehouse_metrics to avoid import side-effects
-    with patch("src.warehouse.warehouse.warehouse_metrics") as _m:
-        _m.record_insert = lambda **_: None
-        _m.record_query = lambda **_: None
-        _m.record_compaction = lambda: None
 
     from src.warehouse.warehouse import WarehouseManager  # noqa: PLC0415
     wm = WarehouseManager(str(cfg_path))
@@ -101,11 +94,8 @@ def tmp_warehouse(tmp_path):
     """Provides a fresh WarehouseManager per test."""
     from unittest.mock import patch
 
-    with patch("src.warehouse.warehouse.warehouse_metrics") as mock_metrics:
-        mock_metrics.record_insert = lambda **_: None
-        mock_metrics.record_query = lambda **_: None
-        mock_metrics.record_compaction = lambda: None
-        mock_metrics.update_stats_cache = lambda **_: None
+    # warehouse_metrics is a late import inside mixin methods; patch at source.
+    with patch("service.services.warehouse_metrics.warehouse_metrics"):
         wm = _make_warehouse(tmp_path)
         yield wm
 
@@ -434,14 +424,11 @@ def test_staging_survives_restart(tmp_path):
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.dump(cfg))
 
-    with patch("src.warehouse.warehouse.warehouse_metrics") as mock_metrics:
-        mock_metrics.record_insert = lambda **_: None
-        mock_metrics.record_query = lambda **_: None
-        mock_metrics.record_compaction = lambda: None
-        mock_metrics.update_stats_cache = lambda **_: None
+    from unittest.mock import patch
+    from src.warehouse.warehouse import WarehouseManager
 
-        from src.warehouse.warehouse import WarehouseManager
-
+    # warehouse_metrics is a late import inside mixin methods; patch at source.
+    with patch("service.services.warehouse_metrics.warehouse_metrics"):
         # First instance: insert 5 logs
         wm1 = WarehouseManager(str(cfg_path))
         wm1.ensure_warehouse()
