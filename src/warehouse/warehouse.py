@@ -151,6 +151,14 @@ class WarehouseManager:
         # Disable on memory-constrained deployments; phases 1+2 are sufficient.
         self.s3_merge_enabled = compaction_config.get("s3_merge_enabled", True)
 
+        alb_cfg = self.config.get("alb", {})
+        alb_compact_cfg = alb_cfg.get("compaction", {})
+        self.alb_compaction_enabled = alb_compact_cfg.get("enabled", True)
+        self.alb_compaction_interval = int(alb_compact_cfg.get("interval_seconds", 600))
+        # Only compact a day-partition when it has more than this many data files
+        self.alb_compaction_min_files = int(alb_compact_cfg.get("min_files_per_partition", 2))
+        self.alb_table_name = alb_cfg.get("table_name", "alb_logs")
+
         retention_config = self.config.get("retention", {})
         self.retention_days = retention_config.get("days", 7)
         self.retention_enabled = retention_config.get("enabled", True)
@@ -163,6 +171,7 @@ class WarehouseManager:
         self._compaction_thread: Optional[threading.Thread] = None
         self._wal_flush_thread: Optional[threading.Thread] = None   # WAL → cold, runs faster
         self._retention_thread: Optional[threading.Thread] = None
+        self._alb_compaction_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         # Two fine-grained locks replace the former single _staging_lock:
         #   _wal_write_lock  – protects WAL file creation/listing/deletion
@@ -1473,6 +1482,140 @@ class WarehouseManager:
             logger.error(f"[Compaction] Error: {type(e).__name__}: {str(e)[:200]}")
             return {"status": "error", "message": f"{type(e).__name__}: {str(e)[:200]}"}
 
+    def compact_alb(self, table_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Daily compaction for the ALB Iceberg table.
+
+        For each ``event_day`` partition that contains more than
+        ``alb_compaction_min_files`` data files:
+          1. Read the entire partition into memory (one day at a time).
+          2. Sort by ``time`` ascending.
+          3. Atomically replace the partition via
+             ``table.dynamic_partition_overwrite()`` — this produces a single
+             compact Parquet file for that day and removes the old small files.
+
+        Partitions for today (UTC) are skipped because they may still be
+        receiving new data from the SQS consumer.
+        """
+        if not PYICEBERG_AVAILABLE:
+            return {"status": "skipped", "reason": "PyIceberg not available"}
+
+        target = table_name or self.alb_table_name
+        table_id = f"{self.namespace}.{target}"
+
+        try:
+            tbl = self.catalog.load_table(table_id)
+        except Exception as e:
+            logger.debug(f"[ALB Compaction] Table {table_id} not found: {e}")
+            return {"status": "skipped", "reason": f"Table not found: {e}"}
+
+        snapshot = tbl.current_snapshot()
+        if snapshot is None:
+            return {"status": "skipped", "reason": "No snapshot yet"}
+
+        import pyarrow as pa
+        from pyiceberg.expressions import And, GreaterThanOrEqual, LessThan
+
+        # ---- collect file counts per day partition (metadata only) ----
+        partition_file_counts: Dict[int, int] = {}
+        try:
+            for manifest in snapshot.manifests(tbl.io):
+                for entry in manifest.fetch_manifest_entry(tbl.io):
+                    try:
+                        day_val = entry.data_file.partition[0]
+                        if day_val is not None:
+                            partition_file_counts[int(day_val)] = (
+                                partition_file_counts.get(int(day_val), 0) + 1
+                            )
+                    except (IndexError, TypeError, AttributeError):
+                        pass
+        except Exception as e:
+            logger.warning(f"[ALB Compaction] Manifest scan error: {e}")
+            return {"status": "error", "message": str(e)}
+
+        if not partition_file_counts:
+            return {"status": "ok", "partitions_compacted": 0, "rows_rewritten": 0}
+
+        today_day = int(datetime.now(timezone.utc).timestamp() // 86400)
+        compacted_partitions = 0
+        rows_rewritten = 0
+
+        for day_val in sorted(partition_file_counts):
+            file_count = partition_file_counts[day_val]
+
+            # Skip today's partition — may still be receiving new data
+            if day_val >= today_day:
+                logger.debug(
+                    f"[ALB Compaction] Skipping day={day_val} (today or future)"
+                )
+                continue
+
+            if file_count < self.alb_compaction_min_files:
+                logger.debug(
+                    f"[ALB Compaction] day={day_val}: {file_count} file(s) — nothing to do"
+                )
+                continue
+
+            day_start = datetime(
+                *time.gmtime(day_val * 86400)[:6], tzinfo=None
+            )  # naive UTC
+            day_end = datetime(
+                *time.gmtime((day_val + 1) * 86400)[:6], tzinfo=None
+            )
+            day_str = day_start.strftime("%Y-%m-%d")
+
+            logger.info(
+                f"[ALB Compaction] Compacting day={day_str}: {file_count} files"
+            )
+
+            try:
+                row_filter = And(
+                    GreaterThanOrEqual("time", day_start.isoformat()),
+                    LessThan("time", day_end.isoformat()),
+                )
+                batches = [
+                    pa.Table.from_batches([rb])
+                    for rb in tbl.scan(row_filter=row_filter).to_arrow_batch_reader()
+                    if rb.num_rows > 0
+                ]
+                if not batches:
+                    logger.debug(
+                        f"[ALB Compaction] day={day_str}: scan returned no rows — skipping"
+                    )
+                    continue
+
+                merged = pa.concat_tables(batches, promote_options="default")
+                del batches
+                # Sort by time for optimal query performance
+                merged = merged.sort_by([("time", "ascending")])
+
+                # Reload table to use latest snapshot before overwriting
+                tbl = self.catalog.load_table(table_id)
+                n_rows = merged.num_rows
+                tbl.overwrite(merged, overwrite_filter=row_filter)
+                del merged
+                rows_rewritten += n_rows
+                compacted_partitions += 1
+
+                logger.info(
+                    f"[ALB Compaction] day={day_str}: merged {file_count} files "
+                    f"-> 1 file ({n_rows} rows)"
+                )
+            except Exception as part_err:
+                logger.warning(
+                    f"[ALB Compaction] day={day_str} error: {part_err}"
+                )
+
+        logger.info(
+            f"[ALB Compaction] Done: {compacted_partitions} partitions compacted, "
+            f"{rows_rewritten} rows rewritten"
+        )
+        return {
+            "status": "ok",
+            "partitions_compacted": compacted_partitions,
+            "rows_rewritten": rows_rewritten,
+        }
+
     def enforce_retention(self):
         if not self.retention_enabled:
             return {"status": "skipped", "reason": "disabled"}
@@ -1671,6 +1814,21 @@ class WarehouseManager:
             if not self._stop_event.is_set():
                 self.enforce_retention()
 
+    def _alb_compaction_loop(self):
+        """Compact ALB day-partitions every alb_compaction_interval seconds."""
+        # Initial delay of 60 s so startup ingest settles first
+        if self._stop_event.wait(timeout=60):
+            return
+        try:
+            self.compact_alb()
+        except Exception as e:
+            logger.warning(f"[ALB Compaction] Initial run error: {e}")
+        while not self._stop_event.wait(timeout=self.alb_compaction_interval):
+            try:
+                self.compact_alb()
+            except Exception as e:
+                logger.warning(f"[ALB Compaction] Loop error: {e}")
+
     def _check_and_repair_catalog(self) -> bool:
         import psycopg2
 
@@ -1807,6 +1965,17 @@ class WarehouseManager:
             self._retention_thread.start()
             logger.info(f"Started retention enforcement thread")
 
+        if self.alb_compaction_enabled and not self._alb_compaction_thread:
+            self._alb_compaction_thread = threading.Thread(
+                target=self._alb_compaction_loop, daemon=True
+            )
+            self._alb_compaction_thread.start()
+            logger.info(
+                f"Started ALB compaction thread "
+                f"(interval: {self.alb_compaction_interval}s, "
+                f"min_files: {self.alb_compaction_min_files})"
+            )
+
     def stop_maintenance(self):
         # Signal threads to stop
         self._stop_event.set()
@@ -1833,4 +2002,6 @@ class WarehouseManager:
             self._compaction_thread.join(timeout=10)
         if self._retention_thread:
             self._retention_thread.join(timeout=5)
+        if self._alb_compaction_thread:
+            self._alb_compaction_thread.join(timeout=5)
         logger.info("Stopped all maintenance threads")

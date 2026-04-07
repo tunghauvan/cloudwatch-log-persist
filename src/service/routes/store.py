@@ -35,6 +35,19 @@ def trigger_compaction():
         return jsonify({"error": str(e)}), 500
 
 
+@store_bp.route("/warehouse/compact-alb", methods=["POST"])
+def trigger_alb_compaction():
+    try:
+        from service.server import warehouse
+
+        if not warehouse:
+            return jsonify({"error": "Warehouse not initialized"}), 500
+        result = warehouse.compact_alb()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @store_bp.route("/warehouse/retention", methods=["POST"])
 def trigger_retention():
     try:

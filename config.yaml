@@ -89,3 +89,7 @@ alb:
   sqs_visibility_timeout: 60  # seconds message is hidden while processing
   # samples_dir: path (relative to project root) used by POST /alb/simulate-sqs
   samples_dir: samples
+  compaction:
+    enabled: true
+    interval_seconds: 600     # run every 10 minutes
+    min_files_per_partition: 2  # only compact day-partitions with >= this many files
