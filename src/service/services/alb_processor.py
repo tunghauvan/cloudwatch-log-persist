@@ -66,6 +66,63 @@ class ALBProcessor:
     # Public API
     # ------------------------------------------------------------------
 
+    def process_local_file(self, file_path: str) -> Dict[str, Any]:
+        """
+        Read a local ALB log file (plain or gzip), parse it, and append rows
+        to the alb_logs Iceberg table.  Used by POST /alb/simulate-sqs.
+
+        The caller MUST verify that file_path is inside the allowed samples
+        directory before calling this method.
+
+        Returns a status dict identical to process_s3_object:
+            {status, rows_written, duration_ms, error?}
+        """
+        start = time.time()
+        try:
+            with open(file_path, "rb") as fh:
+                content: bytes = fh.read()
+        except OSError as e:
+            logger.error(f"[ALB] Local file read failed for {file_path}: {e}")
+            return {
+                "status": "error",
+                "error": f"File read failed: {e}",
+                "rows_written": 0,
+                "duration_ms": int((time.time() - start) * 1000),
+            }
+
+        from service.services.alb_parser import parse_alb_content
+        rows = parse_alb_content(content)
+        logger.info(
+            f"[ALB] Parsed {len(rows)} rows from local file {file_path} "
+            f"({len(content)} bytes)"
+        )
+
+        if not rows:
+            return {
+                "status": "ok",
+                "rows_written": 0,
+                "duration_ms": int((time.time() - start) * 1000),
+            }
+
+        try:
+            self._ensure_table()
+            self._write_rows(rows)
+        except Exception as e:
+            logger.error(f"[ALB] Iceberg write failed: {e}")
+            return {
+                "status": "error",
+                "error": f"Iceberg write failed: {e}",
+                "rows_written": 0,
+                "duration_ms": int((time.time() - start) * 1000),
+            }
+
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info(
+            f"[ALB] Written {len(rows)} rows in {duration_ms}ms "
+            f"(local file {file_path})"
+        )
+        return {"status": "ok", "rows_written": len(rows), "duration_ms": duration_ms}
+
     def process_s3_object(self, bucket: str, key: str) -> Dict[str, Any]:
         """
         Download one S3 object, parse it as ALB access logs, and append rows

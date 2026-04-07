@@ -81,7 +81,11 @@ alb:
   enabled: true
   table_name: alb_logs
   batch_size: 10000
-  # SQS (future) — leave blank when testing via /alb/s3-event
+  # SQS — set sqs_queue_url to enable background polling consumer
+  # Leave blank to disable (use POST /alb/s3-event or /alb/simulate-sqs instead)
   sqs_queue_url: ""
-  sqs_visibility_timeout: 60
-  sqs_max_messages: 5
+  sqs_poll_interval: 30       # seconds between receive_message calls
+  sqs_max_messages: 5         # messages per receive_message call (1-10)
+  sqs_visibility_timeout: 60  # seconds message is hidden while processing
+  # samples_dir: path (relative to project root) used by POST /alb/simulate-sqs
+  samples_dir: samples

@@ -330,3 +330,93 @@ def grafana_tag_keys():
 def grafana_tag_values():
     # Stub — could be extended to query distinct values from the table
     return jsonify([])
+
+
+# ---------------------------------------------------------------------------
+# Simulate SQS — load a local file from samples/ without needing real SQS/S3
+# ---------------------------------------------------------------------------
+
+def _resolve_samples_dir() -> "Path":
+    """Return the absolute path of the samples directory."""
+    from pathlib import Path
+    cfg = _get_config()
+    samples_dir = cfg.get("alb", {}).get("samples_dir", "samples")
+    base = Path(cfg.get("_project_root", "")) or Path(__file__).parent.parent.parent.parent
+    resolved = (base / samples_dir).resolve()
+    return resolved
+
+
+@alb_bp.route("/simulate-sqs", methods=["POST"])
+def simulate_sqs():
+    """
+    Simulate an SQS S3-Event notification using a local file from samples/.
+
+    Accepted body formats
+    ---------------------
+    Option A — filename only:
+        { "filename": "695414238084_...log.gz" }
+
+    Option B — full SQS/S3-Event JSON with local flag:
+        { "sqs_message": { "Records": [{...}] }, "local": true }
+        The key's basename is matched against files in samples/.
+
+    Response is the same JSON structure as POST /alb/s3-event.
+    """
+    import os
+    from pathlib import Path
+
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    samples_dir = _resolve_samples_dir()
+
+    # --- resolve filename ---
+    filename: Optional[str] = None
+
+    if "filename" in body:
+        filename = os.path.basename(str(body["filename"]))
+
+    elif body.get("local") and "sqs_message" in body:
+        records = body["sqs_message"].get("Records", [])
+        if not records:
+            return jsonify({"error": "sqs_message has no Records"}), 400
+        key = records[0].get("s3", {}).get("object", {}).get("key", "")
+        filename = os.path.basename(key)
+
+    else:
+        return jsonify({
+            "error": "provide 'filename' or 'sqs_message' + 'local': true"
+        }), 400
+
+    if not filename:
+        return jsonify({"error": "could not determine filename"}), 400
+
+    # Security: reject any path traversal attempt
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        return jsonify({"error": "invalid filename"}), 400
+
+    file_path = (samples_dir / filename).resolve()
+
+    # Ensure the resolved path is still inside samples_dir
+    try:
+        file_path.relative_to(samples_dir)
+    except ValueError:
+        return jsonify({"error": "filename escapes samples directory"}), 400
+
+    if not file_path.exists():
+        available = [f.name for f in samples_dir.iterdir() if f.is_file()]
+        return jsonify({
+            "error": f"file not found: {filename}",
+            "available": available,
+        }), 404
+
+    processor, err = _get_processor()
+    if err:
+        return jsonify({"error": err}), 503
+
+    result = processor.process_local_file(str(file_path))
+    result["file"] = filename
+    status_code = 200 if result.get("status") == "ok" else 500
+    return jsonify(result), status_code

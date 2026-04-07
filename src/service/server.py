@@ -64,6 +64,15 @@ try:
     logger.info(f"Warehouse initialized: {warehouse.catalog_name} at {warehouse.warehouse_path}")
     logger.debug(f"Warehouse stats: {stats}")
     logger.info(f"Buffer config: max_size={buffer_max_size}, flush_interval={buffer_flush_interval}s, workers={buffer_worker_threads}, wal_enabled={wal_enabled}")
+
+    # Start SQS consumer if queue URL is configured
+    alb_cfg = config.get("alb", {})
+    if alb_cfg.get("enabled", True) and alb_cfg.get("sqs_queue_url", "").strip():
+        import atexit
+        from service.services.sqs_consumer import SQSConsumer
+        _sqs_consumer = SQSConsumer(warehouse, config)
+        _sqs_consumer.start()
+        atexit.register(_sqs_consumer.stop)
 except Exception as e:
     logger.error(f"Failed to initialize warehouse/buffer: {e}")
 

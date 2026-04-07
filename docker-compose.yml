@@ -27,6 +27,7 @@ services:
       - ./config.yaml:/app/config.yaml
       - ./wal:/app/wal
       - staging_data:/app/staging
+      - ./samples:/app/samples:ro
     ports:
       - 4588:4588
     environment:
