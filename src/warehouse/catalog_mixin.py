@@ -73,6 +73,12 @@ class CatalogMixin:
         base = base.rstrip("/")
         return f"{base}/delta/{table_name}"
 
+    def _get_alb_delta_uri(self) -> str:
+        """Return the S3 URI for the ALB Delta table."""
+        alb_cfg = self.config.get("alb", {})
+        table_name = alb_cfg.get("table_name", "alb_logs")
+        return self._get_delta_uri(table_name)
+
     # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------

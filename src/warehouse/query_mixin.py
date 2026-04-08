@@ -110,6 +110,7 @@ class QueryMixin:
         labels_filter: Optional[Dict[str, str]] = None,
         columns: Optional[List[str]] = None,
         limit: int = 500_000,
+        message_filter: Optional[str] = None,
     ) -> pa.Table:
         """Query a Delta Lake table on S3/MinIO using DuckDB delta_scan().
 
@@ -166,6 +167,23 @@ class QueryMixin:
                 mapped = label_mapping.get(k, k)
                 conditions.append(f"label_{mapped} = ?")
                 params.append(v)
+
+        if message_filter:
+            if message_filter.startswith("level:"):
+                levels = [lv.strip() for lv in message_filter[6:].split(",")]
+                _kw_map = {
+                    "error": ["error", "exception", "fatal"],
+                    "warn": ["warn"],
+                    "info": ["info"],
+                    "debug": ["debug"],
+                }
+                safe_kws = [kw for lv in levels for kw in _kw_map.get(lv, [])]
+                if safe_kws:
+                    or_parts = " OR ".join(f"LOWER(message) LIKE '%{kw}%'" for kw in safe_kws)
+                    conditions.append(f"({or_parts})")
+            else:
+                conditions.append("message ILIKE ?")
+                params.append(f"%{message_filter}%")
 
         # Use SELECT * so delta_scan can push partition columns into file pruning properly.
         # date/hour are partition-derived columns (not in Parquet files) — EXCLUDE syntax
@@ -234,6 +252,147 @@ class QueryMixin:
             return pa.table({})
 
     # ------------------------------------------------------------------
+    # Delta S3 metric aggregation — push COUNT/GROUP BY into DuckDB
+    # ------------------------------------------------------------------
+
+    def _metric_aggregate_duckdb(
+        self,
+        table_name: str,
+        step_seconds: int,
+        agg_label: Optional[str] = None,
+        log_group_name: Optional[str] = None,
+        log_stream_name: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        labels_filter: Optional[Dict[str, str]] = None,
+        message_filter: Optional[str] = None,
+    ) -> list:
+        """Push COUNT(*) time-bucketed aggregation into DuckDB.
+
+        Instead of fetching millions of raw rows to Python, let DuckDB aggregate.
+        Returns list of (bucket_epoch_sec: int, group_val: str|None, count: int).
+        """
+        delta_uri = self._get_delta_uri(table_name)
+        safe_uri = delta_uri.replace("'", "''")
+
+        conditions: List[str] = []
+        params: list = []
+
+        if log_group_name:
+            conditions.append("log_group_name = ?")
+            params.append(log_group_name)
+        if log_stream_name:
+            conditions.append("log_stream_name = ?")
+            params.append(log_stream_name)
+
+        start_dt = self._ms_to_datetime(start_time_ms) if start_time_ms else None
+        end_dt = self._ms_to_datetime(end_time_ms) if end_time_ms else None
+
+        if start_dt:
+            conditions.append("timestamp >= ?")
+            params.append(start_dt)
+        if end_dt:
+            conditions.append("timestamp <= ?")
+            params.append(end_dt)
+
+        if start_dt and end_dt:
+            start_date = start_dt.strftime("%Y-%m-%d")
+            end_date = end_dt.strftime("%Y-%m-%d")
+            if start_date != end_date:
+                conditions.append("date >= ?")
+                params.append(start_date)
+                conditions.append("date <= ?")
+                params.append(end_date)
+        elif start_dt:
+            conditions.append("date >= ?")
+            params.append(start_dt.strftime("%Y-%m-%d"))
+        elif end_dt:
+            conditions.append("date <= ?")
+            params.append(end_dt.strftime("%Y-%m-%d"))
+
+        if labels_filter:
+            label_mapping = {"service_name": "service"}
+            for k, v in labels_filter.items():
+                mapped = label_mapping.get(k, k)
+                conditions.append(f"label_{mapped} = ?")
+                params.append(v)
+
+        if message_filter:
+            if message_filter.startswith("level:"):
+                levels = [lv.strip() for lv in message_filter[6:].split(",")]
+                _kw_map = {
+                    "error": ["error", "exception", "fatal"],
+                    "warn": ["warn"],
+                    "info": ["info"],
+                    "debug": ["debug"],
+                }
+                safe_kws = [kw for lv in levels for kw in _kw_map.get(lv, [])]
+                if safe_kws:
+                    or_parts = " OR ".join(f"LOWER(message) LIKE '%{kw}%'" for kw in safe_kws)
+                    conditions.append(f"({or_parts})")
+            else:
+                conditions.append("message ILIKE ?")
+                params.append(f"%{message_filter}%")
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        step_val = int(step_seconds)
+        bucket_expr = f"(CAST(EXTRACT(EPOCH FROM timestamp) AS BIGINT) / {step_val}) * {step_val}"
+
+        if agg_label == "detected_level":
+            group_expr = (
+                "CASE "
+                "WHEN LOWER(message) LIKE '%error%' OR LOWER(message) LIKE '%exception%' OR LOWER(message) LIKE '%fatal%' THEN 'error' "
+                "WHEN LOWER(message) LIKE '%warn%' THEN 'warn' "
+                "WHEN LOWER(message) LIKE '%debug%' THEN 'debug' "
+                "WHEN LOWER(message) LIKE '%info%' THEN 'info' "
+                "ELSE 'unknown' END"
+            )
+            select = f"{bucket_expr} AS bucket, {group_expr} AS group_val, COUNT(*) AS cnt"
+            group_by = f"1, {group_expr}"
+        elif agg_label:
+            label_mapping = {"service_name": "service"}
+            mapped = label_mapping.get(agg_label, agg_label)
+            col = f"label_{mapped}"
+            select = f"{bucket_expr} AS bucket, {col} AS group_val, COUNT(*) AS cnt"
+            group_by = "1, 2"
+        else:
+            select = f"{bucket_expr} AS bucket, NULL AS group_val, COUNT(*) AS cnt"
+            group_by = "1"
+
+        sql = f"""
+            SELECT {select}
+            FROM delta_scan('{safe_uri}')
+            {where}
+            GROUP BY {group_by}
+            ORDER BY 1
+        """
+
+        def _exec(conn):
+            return conn.execute(sql, params).fetchall()
+
+        try:
+            return _exec(self._get_duckdb_conn())
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in (
+                "not a Delta table", "No log files", "doesn't exist",
+                "Invariant violation", "TableNotFound",
+            )):
+                return []
+            if "404" in msg or "Not Found" in msg:
+                self._reset_duckdb_conn()
+                try:
+                    return _exec(self._get_duckdb_conn())
+                except Exception:
+                    self._reset_duckdb_conn()
+                    return []
+            logger.warning(
+                f"[DuckDB] metric_aggregate failed for '{table_name}': {type(e).__name__}: {e}"
+            )
+            self._reset_duckdb_conn()
+            return []
+
+    # ------------------------------------------------------------------
     # WAL hot tier scan (local JSONL → PyArrow)
     # ------------------------------------------------------------------
 
@@ -245,6 +404,7 @@ class QueryMixin:
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
         labels_filter: Optional[Dict[str, str]] = None,
+        message_filter: Optional[str] = None,
         limit: int = 100_000,
     ) -> Optional[pa.Table]:
         """Read WAL JSONL files and apply filters in-memory via PyArrow compute."""
@@ -296,6 +456,27 @@ class QueryMixin:
                 if col in tbl.schema.names:
                     masks.append(pc.equal(tbl[col], v))
 
+        if message_filter:
+            if message_filter.startswith("level:"):
+                levels = [lv.strip() for lv in message_filter[6:].split(",")]
+                _kw_map = {
+                    "error": ["error", "exception", "fatal"],
+                    "warn": ["warn"],
+                    "info": ["info"],
+                    "debug": ["debug"],
+                }
+                all_kws = [kw for lv in levels for kw in _kw_map.get(lv, [])]
+                if all_kws:
+                    msg_lower = pc.utf8_lower(tbl["message"])
+                    lm = [pc.match_substring(msg_lower, pattern=kw) for kw in all_kws]
+                    combined = lm[0]
+                    for m in lm[1:]:
+                        combined = pc.or_(combined, m)
+                    masks.append(combined)
+            else:
+                msg_lower = pc.utf8_lower(tbl["message"])
+                masks.append(pc.match_substring(msg_lower, pattern=message_filter.lower()))
+
         if masks:
             mask = masks[0]
             for m in masks[1:]:
@@ -318,6 +499,7 @@ class QueryMixin:
         table_name: Optional[str] = None,
         labels_filter: Optional[Dict[str, str]] = None,
         columns: Optional[List[str]] = None,
+        message_filter: Optional[str] = None,
         # Legacy kwargs accepted but ignored (kept for call-site compat)
         filter_expr: Optional[str] = None,
         filter_expression=None,
@@ -344,10 +526,12 @@ class QueryMixin:
 
         try:
             s3_result = self._scan_delta_duckdb(
-                target, **scan_kwargs, columns=columns, limit=scan_limit
+                target, **scan_kwargs, columns=columns, limit=scan_limit,
+                message_filter=message_filter,
             )
             wal_result = self._scan_wal(
-                target, **scan_kwargs, limit=min(scan_limit, 100_000)
+                target, **scan_kwargs, limit=min(scan_limit, 100_000),
+                message_filter=message_filter,
             )
 
             parts = [p for p in (s3_result, wal_result) if p is not None and p.num_rows > 0]
@@ -454,6 +638,7 @@ class QueryMixin:
         limit: int = 100,
         table_name: Optional[str] = None,
         labels_filter: Optional[Dict[str, str]] = None,
+        message_filter: Optional[str] = None,
     ):
         import calendar
 
@@ -465,6 +650,7 @@ class QueryMixin:
             limit=limit,
             table_name=table_name,
             labels_filter=labels_filter,
+            message_filter=message_filter,
         )
 
         def _naive_utc_to_ms(dt) -> int:

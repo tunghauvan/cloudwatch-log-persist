@@ -1,9 +1,9 @@
 """
 ALB analytics query service.
 
-Scans the alb_logs Iceberg table with partition-pruning time filters,
-then aggregates results using pandas.  All public functions return plain
-Python dicts/lists — ready for JSON serialisation.
+Scans the alb_logs Delta table via DuckDB delta_scan() — all aggregations are
+pushed into SQL, so Python never processes raw rows.  All public functions
+return plain Python dicts/lists — ready for JSON serialisation.
 
 Grafana SimpleJSON metric catalogue
 ------------------------------------
@@ -18,9 +18,350 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
-
 logger = logging.getLogger("service.alb_query")
+
+TIMESERIES_METRICS: List[str] = [
+    "request_rate",
+    "error_rate",
+    "error_rate_pct",
+    "2xx_rate",
+    "3xx_rate",
+    "4xx_rate",
+    "5xx_rate",
+    "latency_p50",
+    "latency_p95",
+    "latency_p99",
+    "bandwidth_in",
+    "bandwidth_out",
+]
+
+TABLE_METRICS: List[str] = [
+    "top_paths",
+    "top_ips",
+    "status_distribution",
+    "latency_stats",
+]
+
+ALL_METRICS: List[str] = TIMESERIES_METRICS + TABLE_METRICS
+
+
+# ---------------------------------------------------------------------------
+# Internal: DuckDB execution helper
+# ---------------------------------------------------------------------------
+
+def _duckdb_query(warehouse, sql: str, params: list = None):
+    """Run SQL against the warehouse DuckDB connection; return fetchall rows."""
+    conn = warehouse._get_duckdb_conn()
+    try:
+        return conn.execute(sql, params or []).fetchall()
+    except Exception as e:
+        msg = str(e)
+        if any(x in msg for x in (
+            "not a Delta table", "No log files", "doesn't exist",
+            "Invariant violation", "TableNotFound",
+        )):
+            return []
+        if "404" in msg or "Not Found" in msg:
+            warehouse._reset_duckdb_conn()
+            try:
+                return warehouse._get_duckdb_conn().execute(sql, params or []).fetchall()
+            except Exception:
+                warehouse._reset_duckdb_conn()
+                return []
+        logger.warning(f"[ALBQuery] DuckDB error: {type(e).__name__}: {e}")
+        warehouse._reset_duckdb_conn()
+        return []
+
+
+def _alb_scan_sql(warehouse, table_name: str, from_dt: datetime, to_dt: datetime) -> tuple:
+    """Return (delta_uri, where_clause, params) for an alb_logs time-range query."""
+    uri = warehouse._get_delta_uri(table_name)
+    safe_uri = uri.replace("'", "''")
+
+    # Ensure tz-aware → naive UTC for the Delta (us, no-tz) timestamp column
+    def _naive(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    conditions = ["time >= ?", "time <= ?"]
+    params = [_naive(from_dt), _naive(to_dt)]
+
+    # Date-column pruning (avoids DuckDB equality-on-stats bug: only add when range > 1 day)
+    from_date = from_dt.strftime('%Y-%m-%d')
+    to_date = to_dt.strftime('%Y-%m-%d')
+    if from_date != to_date:
+        conditions += ["date >= ?", "date <= ?"]
+        params += [from_date, to_date]
+
+    where = "WHERE " + " AND ".join(conditions)
+    return safe_uri, where, params
+
+
+def _bucket_expr(interval_ms: int) -> str:
+    step_s = max(60, interval_ms // 1000)
+    return f"(CAST(EXTRACT(EPOCH FROM time) AS BIGINT) / {step_s}) * {step_s}"
+
+
+# ---------------------------------------------------------------------------
+# Public: time-series
+# ---------------------------------------------------------------------------
+
+def query_metric_timeseries(
+    warehouse,
+    table_name: str,
+    metric: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    interval_ms: int,
+) -> List[List]:
+    """Return [[value, ts_ms], …] for *metric* over the given time range."""
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    bkt = _bucket_expr(interval_ms)
+
+    if metric == "request_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "error_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} AND elb_status_code >= 400 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "error_rate_pct":
+        sql = f"""
+            SELECT {bkt} AS bkt,
+                   ROUND(100.0 * SUM(CASE WHEN elb_status_code >= 400 THEN 1 ELSE 0 END) / COUNT(*), 4)
+            FROM delta_scan('{safe_uri}') {where}
+            GROUP BY 1 ORDER BY 1
+        """
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[float(v) if v is not None else 0.0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "2xx_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} AND elb_status_code >= 200 AND elb_status_code < 300 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "3xx_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} AND elb_status_code >= 300 AND elb_status_code < 400 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "4xx_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} AND elb_status_code >= 400 AND elb_status_code < 500 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "5xx_rate":
+        sql = f"SELECT {bkt} AS bkt, COUNT(*) FROM delta_scan('{safe_uri}') {where} AND elb_status_code >= 500 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v), int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "latency_p50":
+        sql = f"SELECT {bkt} AS bkt, ROUND(QUANTILE_CONT(target_processing_time, 0.5), 6) FROM delta_scan('{safe_uri}') {where} AND target_processing_time >= 0 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[float(v) if v is not None else 0.0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "latency_p95":
+        sql = f"SELECT {bkt} AS bkt, ROUND(QUANTILE_CONT(target_processing_time, 0.95), 6) FROM delta_scan('{safe_uri}') {where} AND target_processing_time >= 0 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[float(v) if v is not None else 0.0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "latency_p99":
+        sql = f"SELECT {bkt} AS bkt, ROUND(QUANTILE_CONT(target_processing_time, 0.99), 6) FROM delta_scan('{safe_uri}') {where} AND target_processing_time >= 0 GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[float(v) if v is not None else 0.0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "bandwidth_in":
+        sql = f"SELECT {bkt} AS bkt, SUM(received_bytes) FROM delta_scan('{safe_uri}') {where} GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v) if v is not None else 0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    if metric == "bandwidth_out":
+        sql = f"SELECT {bkt} AS bkt, SUM(sent_bytes) FROM delta_scan('{safe_uri}') {where} GROUP BY 1 ORDER BY 1"
+        rows = _duckdb_query(warehouse, sql, params)
+        return [[int(v) if v is not None else 0, int(bkt_s) * 1000] for bkt_s, v in rows]
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Public: table queries
+# ---------------------------------------------------------------------------
+
+def query_top_paths(
+    warehouse,
+    table_name: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    columns = [
+        {"text": "Path", "type": "string"},
+        {"text": "Requests", "type": "number"},
+        {"text": "Errors", "type": "number"},
+        {"text": "Error %", "type": "number"},
+    ]
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    sql = f"""
+        SELECT request_path,
+               COUNT(*) AS cnt,
+               SUM(CASE WHEN elb_status_code >= 400 THEN 1 ELSE 0 END) AS errs,
+               ROUND(100.0 * SUM(CASE WHEN elb_status_code >= 400 THEN 1 ELSE 0 END) / COUNT(*), 2) AS err_pct
+        FROM delta_scan('{safe_uri}')
+        {where} AND request_path IS NOT NULL
+        GROUP BY request_path
+        ORDER BY cnt DESC
+        LIMIT {int(limit)}
+    """
+    rows_raw = _duckdb_query(warehouse, sql, params)
+    rows = [[path, int(cnt), int(errs), float(err_pct) if err_pct is not None else 0.0]
+            for path, cnt, errs, err_pct in rows_raw]
+    return {"type": "table", "columns": columns, "rows": rows}
+
+
+def query_top_ips(
+    warehouse,
+    table_name: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    columns = [
+        {"text": "Client IP", "type": "string"},
+        {"text": "Requests", "type": "number"},
+    ]
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    sql = f"""
+        SELECT client_ip, COUNT(*) AS cnt
+        FROM delta_scan('{safe_uri}')
+        {where} AND client_ip IS NOT NULL
+        GROUP BY client_ip
+        ORDER BY cnt DESC
+        LIMIT {int(limit)}
+    """
+    rows_raw = _duckdb_query(warehouse, sql, params)
+    rows = [[ip, int(cnt)] for ip, cnt in rows_raw]
+    return {"type": "table", "columns": columns, "rows": rows}
+
+
+def query_status_distribution(
+    warehouse,
+    table_name: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> Dict[str, Any]:
+    columns = [
+        {"text": "Status Code", "type": "number"},
+        {"text": "Count", "type": "number"},
+        {"text": "Percentage", "type": "number"},
+    ]
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    sql = f"""
+        WITH counts AS (
+            SELECT elb_status_code, COUNT(*) AS cnt
+            FROM delta_scan('{safe_uri}')
+            {where} AND elb_status_code IS NOT NULL
+            GROUP BY elb_status_code
+        ),
+        total AS (SELECT SUM(cnt) AS t FROM counts)
+        SELECT elb_status_code, cnt, ROUND(100.0 * cnt / t, 2)
+        FROM counts, total
+        ORDER BY elb_status_code
+    """
+    rows_raw = _duckdb_query(warehouse, sql, params)
+    rows = [[int(code), int(cnt), float(pct) if pct is not None else 0.0]
+            for code, cnt, pct in rows_raw]
+    return {"type": "table", "columns": columns, "rows": rows}
+
+
+def query_latency_stats(
+    warehouse,
+    table_name: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> Dict[str, Any]:
+    columns = [
+        {"text": "Metric", "type": "string"},
+        {"text": "Value (s)", "type": "number"},
+    ]
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    sql = f"""
+        SELECT
+            ROUND(AVG(target_processing_time), 6)            AS mean,
+            ROUND(QUANTILE_CONT(target_processing_time, 0.50), 6) AS p50,
+            ROUND(QUANTILE_CONT(target_processing_time, 0.75), 6) AS p75,
+            ROUND(QUANTILE_CONT(target_processing_time, 0.90), 6) AS p90,
+            ROUND(QUANTILE_CONT(target_processing_time, 0.95), 6) AS p95,
+            ROUND(QUANTILE_CONT(target_processing_time, 0.99), 6) AS p99,
+            ROUND(MAX(target_processing_time), 6)             AS max
+        FROM delta_scan('{safe_uri}')
+        {where} AND target_processing_time IS NOT NULL AND target_processing_time >= 0
+    """
+    rows_raw = _duckdb_query(warehouse, sql, params)
+    if not rows_raw or rows_raw[0][0] is None:
+        return {"type": "table", "columns": columns, "rows": []}
+    r = rows_raw[0]
+    rows = [
+        ["mean", float(r[0]) if r[0] else 0.0],
+        ["p50",  float(r[1]) if r[1] else 0.0],
+        ["p75",  float(r[2]) if r[2] else 0.0],
+        ["p90",  float(r[3]) if r[3] else 0.0],
+        ["p95",  float(r[4]) if r[4] else 0.0],
+        ["p99",  float(r[5]) if r[5] else 0.0],
+        ["max",  float(r[6]) if r[6] else 0.0],
+    ]
+    return {"type": "table", "columns": columns, "rows": rows}
+
+
+# ---------------------------------------------------------------------------
+# Public: summary stats (REST /alb/stats)
+# ---------------------------------------------------------------------------
+
+def query_stats(
+    warehouse,
+    table_name: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> Dict[str, Any]:
+    safe_uri, where, params = _alb_scan_sql(warehouse, table_name, from_dt, to_dt)
+    sql = f"""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN elb_status_code >= 400 THEN 1 ELSE 0 END) AS errors,
+            SUM(received_bytes)  AS rx,
+            SUM(sent_bytes)      AS tx,
+            ROUND(QUANTILE_CONT(CASE WHEN target_processing_time >= 0 THEN target_processing_time END, 0.50), 6) AS p50,
+            ROUND(QUANTILE_CONT(CASE WHEN target_processing_time >= 0 THEN target_processing_time END, 0.99), 6) AS p99
+        FROM delta_scan('{safe_uri}')
+        {where}
+    """
+    rows_raw = _duckdb_query(warehouse, sql, params)
+    if not rows_raw or rows_raw[0][0] is None or rows_raw[0][0] == 0:
+        return {
+            "total_requests": 0,
+            "error_count": 0,
+            "error_rate_pct": 0.0,
+            "total_received_bytes": 0,
+            "total_sent_bytes": 0,
+            "latency_p50_s": None,
+            "latency_p99_s": None,
+        }
+    total, errors, rx, tx, p50, p99 = rows_raw[0]
+    total = int(total) if total else 0
+    errors = int(errors) if errors else 0
+    return {
+        "total_requests": total,
+        "error_count": errors,
+        "error_rate_pct": round(errors / total * 100, 2) if total > 0 else 0.0,
+        "total_received_bytes": int(rx) if rx else 0,
+        "total_sent_bytes": int(tx) if tx else 0,
+        "latency_p50_s": float(p50) if p50 is not None else None,
+        "latency_p99_s": float(p99) if p99 is not None else None,
+    }
+
 
 TIMESERIES_METRICS: List[str] = [
     "request_rate",

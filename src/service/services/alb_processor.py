@@ -1,6 +1,6 @@
 """
 ALBProcessor: downloads an ALB log file from S3, parses it, and writes rows to
-the Iceberg alb_logs table using the existing warehouse catalog.
+the alb_logs Delta table using delta-rs (same approach as loki/cloudwatch tables).
 """
 
 import logging
@@ -50,17 +50,11 @@ class ALBProcessor:
         return boto3.client("s3", **kwargs)
 
     # ------------------------------------------------------------------
-    # Table initialisation
+    # Table initialisation — no-op for Delta (table created on first write)
     # ------------------------------------------------------------------
 
     def _ensure_table(self) -> None:
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from warehouse.alb_schema import ensure_alb_table
-        ensure_alb_table(
-            self.warehouse.catalog, self.warehouse.namespace, self.table_name
-        )
+        pass  # delta-rs creates the table automatically on first write_deltalake()
 
     # ------------------------------------------------------------------
     # Public API
@@ -180,26 +174,39 @@ class ALBProcessor:
         return {"status": "ok", "rows_written": len(rows), "duration_ms": duration_ms}
 
     # ------------------------------------------------------------------
-    # Iceberg write
+    # Delta write
     # ------------------------------------------------------------------
 
     def _write_rows(self, rows: List[Dict[str, Any]]) -> None:
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from deltalake import write_deltalake
         from warehouse.alb_schema import get_alb_arrow_schema
 
-        table_id = f"{self.warehouse.namespace}.{self.table_name}"
-        table_obj = self.warehouse.catalog.load_table(table_id)
         arrow_schema = get_alb_arrow_schema()
+        delta_uri = self.warehouse._get_alb_delta_uri()
+        storage_options = self.warehouse._get_delta_storage_options()
 
         for i in range(0, len(rows), self.batch_size):
             batch = rows[i : i + self.batch_size]
             arrow_table = self._rows_to_arrow(batch, arrow_schema)
-            table_obj.append(arrow_table)
+            # Resolve existing partitions to avoid schema conflict on first write
+            try:
+                from deltalake import DeltaTable as _DT
+                _existing = _DT(delta_uri, storage_options=storage_options).metadata().partition_columns
+            except Exception:
+                _existing = ["date", "hour"]
+            _partitions = _existing if _existing else ["date", "hour"]
+
+            write_deltalake(
+                delta_uri,
+                arrow_table,
+                mode="append",
+                storage_options=storage_options,
+                schema_mode="merge",
+                partition_by=_partitions,
+            )
             logger.debug(
-                f"[ALB] Appended batch {i // self.batch_size + 1}: "
-                f"{len(batch)} rows"
+                f"[ALB] Appended Delta batch {i // self.batch_size + 1}: "
+                f"{len(batch)} rows → {delta_uri}"
             )
 
     @staticmethod
@@ -223,7 +230,16 @@ class ALBProcessor:
         for row in rows:
             for name in schema.names:
                 val = row.get(name)
-                if name in ts_fields and isinstance(val, datetime) and val.tzinfo is not None:
+                if name in ("date", "hour"):
+                    # Auto-derive partition columns from 'time'
+                    t = row.get("time")
+                    if isinstance(t, datetime):
+                        if t.tzinfo is not None:
+                            t = t.astimezone(timezone.utc)
+                        val = t.strftime("%Y-%m-%d") if name == "date" else t.strftime("%H")
+                    else:
+                        val = None
+                elif name in ts_fields and isinstance(val, datetime) and val.tzinfo is not None:
                     val = val.astimezone(timezone.utc).replace(tzinfo=None)
                 columns[name].append(val)
 

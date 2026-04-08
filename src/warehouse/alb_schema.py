@@ -102,6 +102,8 @@ def get_alb_arrow_schema() -> pa.Schema:
         pa.field("error_reason",             pa.string(),         nullable=True),
         pa.field("trace_id",                 pa.string(),         nullable=True),
         pa.field("ingestion_time",           pa.timestamp("us"),  nullable=True),
+        pa.field("date",                     pa.string(),         nullable=True),
+        pa.field("hour",                     pa.string(),         nullable=True),
     ])
 
 

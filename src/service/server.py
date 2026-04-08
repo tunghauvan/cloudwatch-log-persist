@@ -17,6 +17,7 @@ from service.routes.ingest import ingest_bp
 from service.routes.loki import loki_bp
 from service.routes.metrics import metrics_bp
 from service.routes.alb import alb_bp
+from service.routes.alb_loki import alb_loki_bp
 from service.utils.logging_config import setup_logging
 
 logger = setup_logging()
@@ -79,7 +80,9 @@ def _track_request(response):
                 s["5xx"] += 1
         _maybe_print_summary()
     else:
-        logger.info(f'"{request.method} {path}" {status}')
+        qs = request.query_string.decode("utf-8", errors="replace")
+        full = f"{path}?{qs}" if qs else path
+        logger.info(f'"{request.method} {full}" {status}')
     return response
 
 
@@ -157,6 +160,7 @@ app.register_blueprint(ingest_bp)
 app.register_blueprint(loki_bp)
 app.register_blueprint(metrics_bp)
 app.register_blueprint(alb_bp)
+app.register_blueprint(alb_loki_bp)
 
 
 @app.route("/", methods=["GET"])

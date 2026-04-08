@@ -700,11 +700,10 @@ def _handle_metric_query(warehouse, query: str, start_ms: int, end_ms: int,
     """
     Fast path for Loki metric queries (count_over_time, rate, sum by …).
 
-    Key optimisations vs the old code:
-    - Only fetches `timestamp` + `message` columns from Iceberg (column projection).
-    - Uses PyArrow vectorised compute for bucketing instead of Python row-by-row.
-    - Caps the fetch at 2 M rows (metric aggregation is always approximate anyway).
-    - Empty-string label values are already stripped by the caller.
+    Key optimisations:
+    - COUNT(*) + GROUP BY pushed into DuckDB — no multi-million-row Python fetch.
+    - WAL hot tier fetched separately and aggregated in Python (small, <100 K rows).
+    - detected_level classification done in DuckDB CASE WHEN, not row-by-row Python.
     """
     import pyarrow.compute as pc
     import pyarrow as pa
@@ -725,80 +724,102 @@ def _handle_metric_query(warehouse, query: str, start_ms: int, end_ms: int,
     if by_match:
         agg_label = by_match.group(1).strip()
 
-    # For detected_level we need message; otherwise timestamp-only is enough.
-    need_message = (agg_label == "detected_level" or bool(message_filter))
+    warehousing_labels = {
+        {"service_name": "service"}.get(k, k): v
+        for k, v in labels_filter.items()
+    }
+    table_name = warehouse.config.get("loki", {}).get("table_name", "loki_logs")
 
+    # ---- Delta Lake: push COUNT/GROUP BY into DuckDB (fast, no row transfer) ----
     try:
-        warehousing_labels = {
-            {"service_name": "service"}.get(k, k): v
-            for k, v in labels_filter.items()
-        }
-
-        # Column projection: only pull what we need
-        sel = ("timestamp", "message") if need_message else ("timestamp",)
-
-        arrow_tbl = warehouse.query(
+        delta_rows = warehouse._metric_aggregate_duckdb(
+            table_name=table_name,
+            step_seconds=step_seconds,
+            agg_label=agg_label,
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time_ms=start_ms,
             end_time_ms=end_ms,
             labels_filter=warehousing_labels or None,
-            columns=list(sel),
-            limit=2_000_000,
-            table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
+            message_filter=message_filter,
         )
     except Exception as e:
-        logger.error(f"[metric_query] Warehouse error: {e}", exc_info=True)
-        arrow_tbl = pa.table({"timestamp": pa.array([], type=pa.timestamp("us")),
-                               "message": pa.array([], type=pa.utf8())})
+        logger.error(f"[metric_query] DuckDB aggregate error: {e}", exc_info=True)
+        delta_rows = []
 
-    # Guard: _scan_delta_duckdb may return pa.table({}) (no schema) on S3 errors.
-    # Ensure the table always has at least a timestamp column before proceeding.
-    if "timestamp" not in arrow_tbl.schema.names:
-        arrow_tbl = pa.table({"timestamp": pa.array([], type=pa.timestamp("us")),
-                               "message": pa.array([], type=pa.utf8())})
+    # ---- WAL hot tier: fetch raw rows, aggregate in Python (small, <100 K rows) ----
+    try:
+        wal_tbl = warehouse._scan_wal(
+            table_name=table_name,
+            log_group_name=log_group,
+            log_stream_name=log_stream,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            labels_filter=warehousing_labels or None,
+            limit=100_000,
+        )
+    except Exception:
+        wal_tbl = None
 
-    total_lines = arrow_tbl.num_rows
-
-    # ---- Vectorised bucketing with PyArrow ----
-    # Convert timestamp column (datetime[us]) → epoch-seconds int64
-    ts_col = arrow_tbl.column("timestamp")
-    # Cast to int64 microseconds, divide to get seconds
-    ts_sec = pc.cast(ts_col, pa.int64())                       # µs since epoch
-    ts_sec = pc.divide(ts_sec, pa.scalar(1_000_000, pa.int64()))  # → seconds
-    # Floor to bucket boundary: int64 / int64 in PyArrow = truncating integer division
-    step_scalar = pa.scalar(step_seconds, pa.int64())
-    bucket_col = pc.multiply(
-        pc.divide(ts_sec, step_scalar),
-        step_scalar,
-    )
-
-    if agg_label and agg_label != "detected_level" and f"label_{agg_label}" in arrow_tbl.schema.names:
-        # Group by stored label column
-        mapped = {"service_name": "service"}.get(agg_label, agg_label)
-        col_name = f"label_{mapped}"
-        group_col = arrow_tbl.column(col_name)
-    elif agg_label == "detected_level" and need_message:
-        # Classify each row's message
-        msgs = arrow_tbl.column("message").to_pylist()
-        levels = [_classified_level((m or "").lower()) for m in msgs]
-        group_col = pa.array(levels, type=pa.utf8())
-    else:
-        group_col = None
-
-    # Build bucket → label_val → count using a plain dict (fast enough for ≤2 M rows)
+    # ---- Merge bucket counts ----
     time_buckets: dict = {}
-    bucket_list = bucket_col.to_pylist()
-    group_list = group_col.to_pylist() if group_col is not None else None
 
-    for i, bkt in enumerate(bucket_list):
-        if bkt is None:
+    for bucket, group_val, count in delta_rows:
+        if bucket is None:
             continue
-        lv = group_list[i] if group_list is not None else "total"
-        if lv is None:
-            lv = "unknown"
-        key = (lv, int(bkt))
-        time_buckets[key] = time_buckets.get(key, 0) + 1
+        lv = group_val if group_val is not None else "total"
+        key = (lv, int(bucket))
+        time_buckets[key] = time_buckets.get(key, 0) + count
+
+    if wal_tbl is not None and wal_tbl.num_rows > 0:
+        ts_sec = pc.divide(pc.cast(wal_tbl.column("timestamp"), pa.int64()), pa.scalar(1_000_000, pa.int64()))
+        step_scalar = pa.scalar(step_seconds, pa.int64())
+        bucket_col = pc.multiply(pc.divide(ts_sec, step_scalar), step_scalar)
+        bucket_list = bucket_col.to_pylist()
+
+        if agg_label == "detected_level":
+            msgs = wal_tbl.column("message").to_pylist()
+            group_list = [_classified_level((m or "").lower()) for m in msgs]
+        elif agg_label:
+            mapped = {"service_name": "service"}.get(agg_label, agg_label)
+            col_name = f"label_{mapped}"
+            group_list = (
+                wal_tbl.column(col_name).to_pylist()
+                if col_name in wal_tbl.schema.names else [None] * wal_tbl.num_rows
+            )
+        else:
+            group_list = None
+
+        # Apply message_filter to WAL rows
+        wal_include = None
+        if message_filter:
+            if message_filter.startswith("level:"):
+                levels = [lv.strip() for lv in message_filter[6:].split(",")]
+                _kw_map = {"error": ["error", "exception", "fatal"], "warn": ["warn"], "info": ["info"], "debug": ["debug"]}
+                all_kws = [kw for lv in levels for kw in _kw_map.get(lv, [])]
+                if all_kws:
+                    msg_lower = pc.utf8_lower(wal_tbl.column("message"))
+                    lm = [pc.match_substring(msg_lower, pattern=kw) for kw in all_kws]
+                    combined = lm[0]
+                    for m in lm[1:]:
+                        combined = pc.or_(combined, m)
+                    wal_include = combined.to_pylist()
+            else:
+                msg_lower = pc.utf8_lower(wal_tbl.column("message"))
+                wal_include = pc.match_substring(msg_lower, pattern=message_filter.lower()).to_pylist()
+
+        for i, bkt in enumerate(bucket_list):
+            if bkt is None:
+                continue
+            if wal_include is not None and not wal_include[i]:
+                continue
+            lv = group_list[i] if group_list is not None else "total"
+            if lv is None:
+                lv = "unknown"
+            key = (lv, int(bkt))
+            time_buckets[key] = time_buckets.get(key, 0) + 1
+
+    total_lines = sum(time_buckets.values()) if time_buckets else 0
 
     # Build Loki matrix response
     label_series: dict = {}
@@ -902,62 +923,23 @@ def loki_query_range():
             {"service_name": "service"}.get(k, k): v
             for k, v in labels_filter.items()
         }
-        fetch_limit = limit
-        if message_filter:
-            fetch_limit = max(fetch_limit * 10, 1000)
-
         events = warehouse.get_logs(
             table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
             log_group_name=log_group,
             log_stream_name=log_stream,
             start_time=start,
             end_time=end,
-            limit=fetch_limit,
+            limit=limit,
             labels_filter=warehousing_labels,
+            message_filter=message_filter,
         )
         logger.debug(f" Warehouse returned {len(events)} events")
     except Exception as e:
         logger.error(f" Warehouse error in query_range: {e}", exc_info=True)
         events = []
 
-    # Since warehouse now does the filtering correctly with labels_filter, 
-    # we can skip the manual loop unless there are additional filter types (like message filter)
-    filtered_events = events
-    
-    if message_filter:
-        filtered_events = []
-        # Handle detected_level filters (pseudo message filters with level: prefix)
-        if message_filter.startswith("level:"):
-            target_levels_str = message_filter[6:]  # Extract level names (comma-separated for OR)
-            target_levels = [l.strip() for l in target_levels_str.split(",")]
-            
-            # Map level names to keywords
-            level_keywords = {
-                "error": ["error"],
-                "warn": ["warn", "warning"],
-                "info": ["info", "information"],
-                "debug": ["debug"],
-            }
-            
-            # Collect all keywords for the target levels (OR logic)
-            all_keywords = []
-            for level in target_levels:
-                all_keywords.extend(level_keywords.get(level, []))
-            
-            for e in events:
-                msg = e.get("message", "").lower()
-                # Match if ANY keyword is found (OR logic)
-                if any(kw in msg for kw in all_keywords):
-                    filtered_events.append(e)
-        else:
-            # Regular message filter
-            msg_filter_lower = message_filter.lower()
-            for e in events:
-                if msg_filter_lower in e.get("message", "").lower():
-                    filtered_events.append(e)
-
+    filtered_events = events[:limit]
     logger.debug(f" Filtering done. {len(filtered_events)} events matched.")
-    filtered_events = filtered_events[:limit]
 
     # Regular log query - return streams
     logs = []
