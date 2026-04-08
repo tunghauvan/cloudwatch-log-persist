@@ -734,34 +734,18 @@ def _handle_metric_query(warehouse, query: str, start_ms: int, end_ms: int,
             for k, v in labels_filter.items()
         }
 
-        # Build filter expression directly (avoids full dict→event conversion)
-        from pyiceberg.expressions import (
-            And, EqualTo, GreaterThanOrEqual, LessThanOrEqual, AlwaysTrue
-        )
-        from datetime import datetime, timezone
-
-        fexpr = AlwaysTrue()
-        if log_group:
-            fexpr = And(fexpr, EqualTo("log_group_name", log_group))
-        if log_stream:
-            fexpr = And(fexpr, EqualTo("log_stream_name", log_stream))
-        if start_ms:
-            ts_s = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
-            fexpr = And(fexpr, GreaterThanOrEqual("timestamp", ts_s))
-        if end_ms:
-            ts_e = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
-            fexpr = And(fexpr, LessThanOrEqual("timestamp", ts_e))
-        for k, v in warehousing_labels.items():
-            fexpr = And(fexpr, EqualTo(f"label_{k}", v))
-
         # Column projection: only pull what we need
         sel = ("timestamp", "message") if need_message else ("timestamp",)
 
         arrow_tbl = warehouse.query(
-            filter_expression=fexpr,
+            log_group_name=log_group,
+            log_stream_name=log_stream,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            labels_filter=warehousing_labels or None,
+            columns=list(sel),
             limit=2_000_000,
             table_name=warehouse.config.get("loki", {}).get("table_name", "loki_logs"),
-            selected_fields=sel,
         )
     except Exception as e:
         logger.error(f"[metric_query] Warehouse error: {e}", exc_info=True)

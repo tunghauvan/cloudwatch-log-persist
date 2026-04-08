@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import threading
+import collections
 from pathlib import Path
 from flask import Flask, request, jsonify
 
@@ -20,6 +22,76 @@ from service.utils.logging_config import setup_logging
 logger = setup_logging()
 
 app = Flask(__name__)
+
+# --- Access log: summarize high-frequency ingest/health paths every 15s,
+#     log everything else per-request as usual. ---
+_SUMMARIZED_PATHS = {
+    "/loki/api/v1/push",
+    "/ingest/logs",
+    "/ingest/logs/batch",
+    "/ingest/health",
+    "/health",
+    "/ready",
+}
+
+_access_stats = collections.defaultdict(lambda: {"count": 0, "2xx": 0, "4xx": 0, "5xx": 0})
+_access_lock = threading.Lock()
+_last_summary_time = time.time()
+_SUMMARY_INTERVAL = 15
+
+
+def _maybe_print_summary(force=False):
+    global _last_summary_time
+    now = time.time()
+    if not force and now - _last_summary_time < _SUMMARY_INTERVAL:
+        return
+    with _access_lock:
+        if not force and now - _last_summary_time < _SUMMARY_INTERVAL:
+            return
+        snapshot = dict(_access_stats)
+        _access_stats.clear()
+        elapsed = now - _last_summary_time
+        _last_summary_time = now
+
+    if not snapshot:
+        return
+
+    total = sum(v["count"] for v in snapshot.values())
+    lines = []
+    for path, s in sorted(snapshot.items(), key=lambda x: -x[1]["count"]):
+        lines.append(f"  {path}: {s['count']} req (2xx={s['2xx']} 4xx={s['4xx']} 5xx={s['5xx']})")
+    logger.info(f"[Access] {total} requests in last {elapsed:.0f}s\n" + "\n".join(lines))
+
+
+@app.after_request
+def _track_request(response):
+    path = request.path
+    status = response.status_code
+    if path in _SUMMARIZED_PATHS:
+        with _access_lock:
+            s = _access_stats[path]
+            s["count"] += 1
+            if 200 <= status < 400:
+                s["2xx"] += 1
+            elif 400 <= status < 500:
+                s["4xx"] += 1
+            else:
+                s["5xx"] += 1
+        _maybe_print_summary()
+    else:
+        logger.info(f'"{request.method} {path}" {status}')
+    return response
+
+
+def _summary_ticker():
+    while True:
+        time.sleep(_SUMMARY_INTERVAL)
+        _maybe_print_summary(force=True)
+
+
+_ticker = threading.Thread(target=_summary_ticker, daemon=True, name="access-summary")
+_ticker.start()
+# ---------------------------------------------------------------------------
 
 config_path = Path(os.getenv("CONFIG_PATH", "/app/config.yaml"))
 warehouse = None
@@ -614,14 +686,22 @@ def admin_gc():
 
 def shutdown():
     print("[Server] Shutting down...")
+    # Warehouse first: flush WAL/cold while PyArrow is still fully operational.
+    # Buffer stop is second because it can trigger internal executor teardown.
+    if warehouse:
+        try:
+            warehouse.stop_maintenance()
+        except (RuntimeError, Exception) as e:
+            print(f"[Server] Warehouse shutdown error (WAL is safe on disk): {e}")
     if log_buffer:
         print(f"[Server] Flushing buffer ({log_buffer.size()} logs)...")
         log_buffer.stop()
         print("[Server] Buffer flushed")
 
 
-if __name__ == "__main__":
-    import atexit
+import atexit
+atexit.register(shutdown)
 
-    atexit.register(shutdown)
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=4588, debug=True)

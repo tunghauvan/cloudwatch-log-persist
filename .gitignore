@@ -56,3 +56,4 @@ wal/
 compaction-test/
 helm/
 samples/
+.kube/

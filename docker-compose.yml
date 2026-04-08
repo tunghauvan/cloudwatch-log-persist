@@ -28,12 +28,15 @@ services:
       - ./wal:/app/wal
       - staging_data:/app/staging
       - ./samples:/app/samples:ro
+      - duckdb_tmp:/app/duckdb_tmp
     ports:
       - 4588:4588
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app/src
       - AWS_EC2_METADATA_SERVICE_ENDPOINT=http://172.31.80.64/gurkha
+      - DUCKDB_TEMP_DIR=/app/duckdb_tmp
+      - DUCKDB_MEMORY_LIMIT=512MB
     # resource lmits to prevent noisy neighbour issues in local dev; adjust as needed for production
     deploy:
       resources:
@@ -50,7 +53,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    command: ["gunicorn", "--workers", "1", "--threads", "8", "--worker-class", "gthread", "--bind", "0.0.0.0:4588", "--timeout", "120", "--access-logfile", "-", "service.server:app"]
+    command: ["gunicorn", "--workers", "1", "--threads", "8", "--worker-class", "gthread", "--bind", "0.0.0.0:4588", "--timeout", "120", "--access-logfile", "/dev/null", "service.server:app"]
 
   minio:
     image: minio/minio
@@ -218,5 +221,6 @@ volumes:
   postgres_data:
   minio_data:
   staging_data:
+  duckdb_tmp:
   superset_db_data:
   superset_home:

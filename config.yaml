@@ -39,7 +39,7 @@ compaction:
   max_data_files: 1000
   local_staging_dir: /app/staging   # Mounted as a persistent Docker volume — survives restarts
   wal_max_rows: 500000              # Pause ingest if WAL+cold exceeds this (backpressure)
-  wal_flush_interval_seconds: 30   # Flush WAL -> cold every 30 s (independent of full compaction)
+  wal_flush_interval_seconds: 60   # Flush WAL -> cold every 60 s (independent of full compaction)
   # Phase 3 (S3 in-place merge) reads entire partitions into RAM.
   # Disable it to avoid OOM on large datasets. WAL->cold->S3 (phases 1+2)
   # already keeps the table queryable; phase 3 is only a cosmetic file-count reduction.

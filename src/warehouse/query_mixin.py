@@ -1,279 +1,361 @@
+import json
 import logging
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+import pyarrow as pa
+import pyarrow.compute as pc
 
 logger = logging.getLogger("service.warehouse")
 
-try:
-    from pyiceberg.expressions import (
-        And,
-        EqualTo,
-        GreaterThanOrEqual,
-        LessThanOrEqual,
-        AlwaysTrue,
-    )
-    from pyiceberg.expressions.literals import TimestampLiteral
-
-    PYICEBERG_AVAILABLE = True
-except ImportError:
-    PYICEBERG_AVAILABLE = False
+# Thread-local DuckDB connections (one per gunicorn worker thread)
+_duckdb_local = threading.local()
 
 
 class QueryMixin:
-    """Query and read operations for the warehouse."""
+    """Query operations: DuckDB → Delta S3 + PyArrow WAL hot tier."""
 
-    def _scan_to_arrow_with_limit(self, scan, limit: int):
-        import pyarrow as pa
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        batch_reader = scan.to_arrow_batch_reader()
-        batches = []
-        rows_collected = 0
+    @staticmethod
+    def _ms_to_datetime(ms: int) -> datetime:
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
 
-        for batch in batch_reader:
-            if batch.num_rows <= 0:
-                continue
+    def _get_duckdb_conn(self):
+        """Return a thread-local DuckDB connection configured for S3/MinIO."""
+        if getattr(_duckdb_local, "conn", None) is not None:
+            return _duckdb_local.conn
 
-            remaining = limit - rows_collected
-            if batch.num_rows > remaining:
-                batches.append(batch.slice(0, remaining))
-                rows_collected += remaining
+        import duckdb
+
+        conn = duckdb.connect()
+
+        # Install extensions (idempotent — fast if already cached locally)
+        for ext in ("httpfs", "delta"):
+            try:
+                conn.execute(f"INSTALL {ext}; LOAD {ext};")
+            except Exception as e:
+                logger.warning(f"[DuckDB] Could not install extension '{ext}': {e}")
+
+        s3_cfg = self.config.get("s3", {})
+        use_ec2_role = s3_cfg.get("use_ec2_role", False)
+        region = s3_cfg.get("region", "us-east-1")
+
+        if not use_ec2_role:
+            access_key = s3_cfg.get("access_key", "admin")
+            secret_key = s3_cfg.get("secret_key", "admin123")
+            endpoint = s3_cfg.get("endpoint", "").strip()
+
+            # Use DuckDB Secret API — the delta extension (delta-kernel-rs) reads
+            # credentials from Secrets, not from the legacy SET s3_* variables.
+            secret_sql = f"""
+                CREATE OR REPLACE SECRET _s3_secret (
+                    TYPE S3,
+                    KEY_ID '{access_key}',
+                    SECRET '{secret_key}',
+                    REGION '{region}'
+            """
+            if endpoint:
+                ep = endpoint.replace("https://", "").replace("http://", "")
+                secret_sql += f",\n                    ENDPOINT '{ep}'"
+                secret_sql += ",\n                    URL_STYLE 'path'"
+                secret_sql += ",\n                    USE_SSL false"
+            secret_sql += "\n                );"
+            conn.execute(secret_sql)
+
+        _duckdb_local.conn = conn
+        return conn
+
+    def _reset_duckdb_conn(self):
+        """Close and discard the thread-local connection (e.g. after a fatal error)."""
+        conn = getattr(_duckdb_local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _duckdb_local.conn = None
+
+    # ------------------------------------------------------------------
+    # Delta S3 scan via DuckDB
+    # ------------------------------------------------------------------
+
+    def _scan_delta_duckdb(
+        self,
+        table_name: str,
+        log_group_name: Optional[str] = None,
+        log_stream_name: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        labels_filter: Optional[Dict[str, str]] = None,
+        columns: Optional[List[str]] = None,
+        limit: int = 500_000,
+    ) -> pa.Table:
+        """Query a Delta Lake table on S3/MinIO using DuckDB delta_scan().
+
+        DuckDB handles:
+        - Partition pruning (date/hour columns pushed to file-selection)
+        - Parquet predicate pushdown (timestamp, log_group_name, etc.)
+        - Streaming result → Arrow without loading all files into RAM
+        """
+        delta_uri = self._get_delta_uri(table_name)
+
+        conditions: List[str] = []
+        params: list = []
+
+        if log_group_name:
+            conditions.append("log_group_name = ?")
+            params.append(log_group_name)
+        if log_stream_name:
+            conditions.append("log_stream_name = ?")
+            params.append(log_stream_name)
+
+        start_dt = self._ms_to_datetime(start_time_ms) if start_time_ms else None
+        end_dt = self._ms_to_datetime(end_time_ms) if end_time_ms else None
+
+        if start_dt:
+            conditions.append("timestamp >= ?")
+            params.append(start_dt)
+        if end_dt:
+            conditions.append("timestamp <= ?")
+            params.append(end_dt)
+        # NOTE: We intentionally do NOT add WHERE filters on the partition columns
+        # `date` and `hour`. DuckDB 1.5.x delta extension has a bug where filtering
+        # on partition-derived columns causes incorrect over-pruning (e.g. adding
+        # `WHERE date = '2026-04-08'` silently drops non-current-hour partitions).
+        # The `timestamp` column filter above is sufficient for correctness; DuckDB
+        # will apply it as a post-scan row filter on all relevant parquet files.
+
+        if labels_filter:
+            label_mapping = {"service_name": "service"}
+            for k, v in labels_filter.items():
+                mapped = label_mapping.get(k, k)
+                conditions.append(f"label_{mapped} = ?")
+                params.append(v)
+
+        # Use SELECT * so delta_scan can push partition columns into file pruning properly.
+        # date/hour are partition-derived columns (not in Parquet files) — EXCLUDE syntax
+        # can behave unexpectedly in some DuckDB versions, so we drop them in Python instead.
+        if columns:
+            # Pull date+hour alongside requested cols so WHERE filters stay consistent.
+            proj_cols = list(dict.fromkeys(["date", "hour"] + list(columns)))
+            col_select = ", ".join(f'"{c}"' for c in proj_cols)
+        else:
+            col_select = "*"
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        sql = f"""
+            SELECT {col_select}
+            FROM delta_scan(?)
+            {where}
+            ORDER BY timestamp ASC
+            LIMIT {int(limit)}
+        """
+
+        try:
+            conn = self._get_duckdb_conn()
+            result = conn.execute(sql, [delta_uri] + params).fetch_arrow_table()
+            # Strip partition helper columns unless explicitly requested
+            drop_cols = {"date", "hour"} - (set(columns) if columns else set())
+            keep = [c for c in result.schema.names if c not in drop_cols]
+            if keep and len(keep) < result.num_columns:
+                result = result.select(keep)
+            return result
+        except Exception as e:
+            msg = str(e)
+            # Table not yet initialised — silently return empty
+            if any(x in msg for x in (
+                "not a Delta table", "No log files", "doesn't exist",
+                "Invariant violation", "TableNotFound",
+            )):
+                return pa.table({})
+            # For other errors (stale file refs, S3 issues) log a warning and return empty
+            # so individual query failures don't bring down the service.
+            logger.warning(
+                f"[DuckDB] delta_scan failed for '{table_name}': {type(e).__name__}: {e}"
+            )
+            self._reset_duckdb_conn()
+            return pa.table({})
+
+    # ------------------------------------------------------------------
+    # WAL hot tier scan (local JSONL → PyArrow)
+    # ------------------------------------------------------------------
+
+    def _scan_wal(
+        self,
+        table_name: str,
+        log_group_name: Optional[str] = None,
+        log_stream_name: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        labels_filter: Optional[Dict[str, str]] = None,
+        limit: int = 100_000,
+    ) -> Optional[pa.Table]:
+        """Read WAL JSONL files and apply filters in-memory via PyArrow compute."""
+        wal_dir = self.local_staging_dir / table_name / "wal"
+        if not wal_dir.exists():
+            return None
+
+        logs = []
+        for f in sorted(wal_dir.glob("wal_*.jsonl"), reverse=True):
+            if len(logs) >= limit:
                 break
+            try:
+                with open(f) as fp:
+                    for line in fp:
+                        line = line.strip()
+                        if line:
+                            logs.append(json.loads(line))
+                            if len(logs) >= limit:
+                                break
+            except Exception:
+                pass
 
-            batches.append(batch)
-            rows_collected += batch.num_rows
+        if not logs:
+            return None
 
-            if rows_collected >= limit:
-                break
+        tbl = self._logs_to_arrow(logs)
 
-        if batches:
-            return pa.Table.from_batches(batches)
+        # Build filter mask using PyArrow compute (vectorised, no row-by-row Python)
+        masks = []
+        if log_group_name:
+            masks.append(pc.equal(tbl["log_group_name"], log_group_name))
+        if log_stream_name:
+            masks.append(pc.equal(tbl["log_stream_name"], log_stream_name))
+        if start_time_ms:
+            start_dt = self._ms_to_datetime(start_time_ms)
+            masks.append(pc.greater_equal(
+                tbl["timestamp"], pa.scalar(start_dt, type=pa.timestamp("us"))
+            ))
+        if end_time_ms:
+            end_dt = self._ms_to_datetime(end_time_ms)
+            masks.append(pc.less_equal(
+                tbl["timestamp"], pa.scalar(end_dt, type=pa.timestamp("us"))
+            ))
+        if labels_filter:
+            label_mapping = {"service_name": "service"}
+            for k, v in labels_filter.items():
+                mapped = label_mapping.get(k, k)
+                col = f"label_{mapped}"
+                if col in tbl.schema.names:
+                    masks.append(pc.equal(tbl[col], v))
 
-        schema = getattr(batch_reader, "schema", None)
-        if schema is not None:
-            return pa.Table.from_batches([], schema=schema)
+        if masks:
+            mask = masks[0]
+            for m in masks[1:]:
+                mask = pc.and_(mask, m)
+            tbl = tbl.filter(mask)
 
-        return scan.to_arrow()
+        return tbl if tbl.num_rows > 0 else None
+
+    # ------------------------------------------------------------------
+    # Public query API
+    # ------------------------------------------------------------------
 
     def query(
         self,
-        filter_expr: Optional[str] = None,
+        log_group_name: Optional[str] = None,
+        log_stream_name: Optional[str] = None,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
         limit: int = 100,
         table_name: Optional[str] = None,
+        labels_filter: Optional[Dict[str, str]] = None,
+        columns: Optional[List[str]] = None,
+        # Legacy kwargs accepted but ignored (kept for call-site compat)
+        filter_expr: Optional[str] = None,
         filter_expression=None,
-        selected_fields: Optional[tuple] = None,
-    ):
+        selected_fields=None,
+    ) -> pa.Table:
         from service.services.warehouse_metrics import warehouse_metrics
 
-        start_time = time.time()
+        start = time.time()
+        target = table_name or self.table_name
 
-        if not PYICEBERG_AVAILABLE:
-            warehouse_metrics.record_query(
-                logs_returned=0, duration_seconds=time.time() - start_time, error=True
-            )
-            raise RuntimeError("PyIceberg is not installed")
+        if selected_fields and not columns:
+            columns = list(selected_fields)
 
-        # Always reload table to get fresh data files
-        target_table_name = table_name or self.table_name
-        table_id = f"{self.namespace}.{target_table_name}"
+        MAX_ROWS = 500_000
+        scan_limit = limit if (limit and limit > 0) else MAX_ROWS
 
-        try:
-            table_obj = self.catalog.load_table(table_id)
-        except Exception as e:
-            if "not found" in str(e).lower() or "nosuch" in str(e).lower():
-                logger.info(f" Table {table_id} not found, returning empty result")
-                warehouse_metrics.record_query(
-                    logs_returned=0,
-                    duration_seconds=time.time() - start_time,
-                    error=False,
-                )
-                import pyarrow as pa
-
-                return pa.table(
-                    {
-                        "log_group_name": [],
-                        "log_stream_name": [],
-                        "timestamp": [],
-                        "message": [],
-                        "ingestion_time": [],
-                        "sequence_token": [],
-                    }
-                )
-            raise
+        scan_kwargs = dict(
+            log_group_name=log_group_name,
+            log_stream_name=log_stream_name,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            labels_filter=labels_filter,
+        )
 
         try:
-            print(
-                f"Running query on {target_table_name} filter_expression={filter_expression is not None} filter_expr={filter_expr}"
+            s3_result = self._scan_delta_duckdb(
+                target, **scan_kwargs, columns=columns, limit=scan_limit
             )
-            # Build scan with optional column projection
-            scan_kwargs = {}
-            if selected_fields:
-                scan_kwargs["selected_fields"] = selected_fields
-            scan = table_obj.scan(**scan_kwargs)
+            wal_result = self._scan_wal(
+                target, **scan_kwargs, limit=min(scan_limit, 100_000)
+            )
 
-            # Prefer typed Expression objects (push-down into Parquet row-group stats)
-            if filter_expression is not None:
-                scan = scan.filter(filter_expression)
-            elif filter_expr:
-                scan = scan.filter(filter_expr)
+            parts = [p for p in (s3_result, wal_result) if p is not None and p.num_rows > 0]
 
-            # Hard cap per tier — prevents OOM on long time-range queries (e.g. 24 h).
-            # Even without an explicit limit, never materialise more than MAX_SCAN_ROWS
-            # rows per tier; after merge+sort the result is still sliced to `limit`.
-            MAX_SCAN_ROWS = 500_000
-            effective_limit = limit if (limit and limit > 0) else MAX_SCAN_ROWS
-
-            # Use batch reader for early stop — avoids downloading all S3 files into RAM
-            s3_result = self._scan_to_arrow_with_limit(scan, effective_limit)
-
-            # Also read local staging Parquet files so data is visible before compaction.
-            import pyarrow as pa
-            import pyarrow.compute as pc
-
-            # ---- Cold tier: local Parquet data, PostgreSQL catalog metadata ----
-            cold_result: Optional[pa.Table] = None
-            try:
-                # Acquire the lock only for the catalog metadata lookup so that
-                # Phase-2 compaction (which holds _cold_lock during drop_table +
-                # catalog reset) cannot race with us.  The actual Parquet scan
-                # happens outside the lock to avoid blocking compaction I/O.
-                with self._cold_lock:
-                    self._ensure_cold_table(target_table_name)
-                    cold_tbl = self.cold_catalog.load_table(f"{self.COLD_NAMESPACE}.{target_table_name}")
-                cold_scan = cold_tbl.scan(**scan_kwargs)
-                if filter_expression is not None:
-                    cold_scan = cold_scan.filter(filter_expression)
-                elif filter_expr:
-                    cold_scan = cold_scan.filter(filter_expr)
-                cold_data = self._scan_to_arrow_with_limit(cold_scan, effective_limit)
-                if cold_data.num_rows > 0:
-                    cold_result = cold_data
-            except Exception as cold_err:
-                logger.debug(f"[Cold] Read skipped: {cold_err}")
-
-            # ---- Hot tier: WAL JSONL files ----
-            import json
-            wal_result: Optional[pa.Table] = None
-            try:
-                wal_dir = self.local_staging_dir / target_table_name / "wal"
-                wal_logs = []
-                # Cap WAL rows read per query to avoid OOM when WAL is large.
-                # We read the newest files first (reverse sort) so recent data is
-                # always visible even when older files push past the cap.
-                # Never exceed 100k from WAL — hot tier shouldn't hold huge datasets.
-                wal_cap = min(max(effective_limit, 10_000), 100_000)
-                if wal_dir.exists():
-                    for f in sorted(wal_dir.glob("wal_*.jsonl"), reverse=True):
-                        if len(wal_logs) >= wal_cap:
-                            break
-                        try:
-                            with open(f) as fp:
-                                for line in fp:
-                                    line = line.strip()
-                                    if line:
-                                        wal_logs.append(json.loads(line))
-                                        if len(wal_logs) >= wal_cap:
-                                            break
-                        except Exception:
-                            pass
-                if wal_logs:
-                    wal_tbl = self._logs_to_arrow(wal_logs)
-                    wal_tbl = self._filter_arrow_table(wal_tbl, filter_expression)
-                    if wal_tbl.num_rows > 0:
-                        wal_result = wal_tbl
-            except Exception as wal_err:
-                logger.debug(f"[WAL] Read skipped: {wal_err}")
-
-            # ---- Merge all 3 tiers ----
-            # Normalise string types: S3/PostgreSQL catalog returns large_utf8,
-            # cold (SQLite) and WAL (Arrow) return utf8. Cast to S3 schema.
-            target_schema = s3_result.schema if s3_result.num_columns > 0 else None
-
-            def _norm(tbl):
-                if tbl is None or target_schema is None or tbl.schema == target_schema:
-                    return tbl
-                try:
-                    return tbl.cast(target_schema)
-                except Exception:
-                    return tbl
-
-            parts = [s3_result]
-            if cold_result is not None and cold_result.num_rows > 0:
-                parts.append(_norm(cold_result))
-            if wal_result is not None and wal_result.num_rows > 0:
-                parts.append(_norm(wal_result))
-
-            if len(parts) > 1:
+            if len(parts) == 0:
+                result = pa.table({})
+            elif len(parts) == 1:
+                result = parts[0]
+            else:
                 try:
                     combined = pa.concat_tables(parts, promote_options="default")
                 except Exception:
                     combined = s3_result
                 sort_idx = pc.sort_indices(combined, sort_keys=[("timestamp", "ascending")])
                 result = combined.take(sort_idx)
-                if limit and limit > 0 and len(result) > limit:
+                if limit and limit > 0 and result.num_rows > limit:
                     result = result.slice(0, limit)
-            else:
-                result = s3_result
 
-            logs_returned = len(result)
-            print(
-                f"Query returned {logs_returned} rows from {target_table_name} "
-                f"(archive={s3_result.num_rows}, cold={cold_result.num_rows if cold_result else 0}, wal={wal_result.num_rows if wal_result else 0})"
+            logger.debug(
+                f"[DuckDB] Query '{target}': {result.num_rows} rows "
+                f"(delta={s3_result.num_rows if s3_result is not None else 0}, "
+                f"wal={wal_result.num_rows if wal_result is not None else 0})"
             )
-
-            # Record successful query
-            duration = time.time() - start_time
             warehouse_metrics.record_query(
-                logs_returned=logs_returned, duration_seconds=duration, error=False
+                logs_returned=result.num_rows,
+                duration_seconds=time.time() - start,
+                error=False,
             )
             return result
-        except FileNotFoundError as e:
-            logger.info(f" Data file not found, rebuilding table: {e}")
-            warehouse_metrics.record_query(
-                logs_returned=0, duration_seconds=time.time() - start_time, error=True
-            )
-            # self._repair_missing_data_files() # Needs update for multi-table
-            import pyarrow as pa
 
-            return pa.table(
-                {
-                    "log_group_name": [],
-                    "log_stream_name": [],
-                    "timestamp": [],
-                    "message": [],
-                    "ingestion_time": [],
-                    "sequence_token": [],
-                }
-            )
         except Exception as e:
             warehouse_metrics.record_query(
-                logs_returned=0, duration_seconds=time.time() - start_time, error=True
+                logs_returned=0,
+                duration_seconds=time.time() - start,
+                error=True,
             )
             raise
 
-        return result
+    # ------------------------------------------------------------------
+    # High-level helpers (log groups, streams, events)
+    # ------------------------------------------------------------------
 
     def get_log_groups(self):
         now = time.time()
         if self._log_groups_cache is not None and now - self._log_groups_cache_time < 30.0:
             return self._log_groups_cache
 
-        # Column projection: only fetch the 2 columns we need — avoids reading message payloads
-        result = self.query(
-            limit=10000,
-            selected_fields=("log_group_name", "ingestion_time"),
-        )
-        col_group = result.column("log_group_name").to_pylist()
-        col_ingestion = result.column("ingestion_time").to_pylist()
-
+        result = self.query(columns=["log_group_name", "ingestion_time"], limit=10000)
         groups = {}
-        for i, group_name in enumerate(col_group):
-            if group_name and group_name not in groups:
-                ts = col_ingestion[i]
-                groups[group_name] = {
-                    "logGroupName": group_name,
+        for lg, ts in zip(
+            result.column("log_group_name").to_pylist(),
+            result.column("ingestion_time").to_pylist(),
+        ):
+            if lg and lg not in groups:
+                groups[lg] = {
+                    "logGroupName": lg,
                     "creationTime": int(ts.timestamp() * 1000) if ts else 0,
                     "metricFilterCount": 0,
-                    "arn": f"arn:aws:logs:us-east-1:123456789012:log-group:{group_name}",
+                    "arn": f"arn:aws:logs:us-east-1:123456789012:log-group:{lg}",
                     "storedBytes": 0,
                 }
 
@@ -287,23 +369,21 @@ class QueryMixin:
         if cached and now - cached[0] < 30.0:
             return cached[1]
 
-        # Expression API + column projection: avoids full-table scan and message reads
         result = self.query(
-            filter_expression=EqualTo("log_group_name", log_group_name),
+            log_group_name=log_group_name,
+            columns=["log_stream_name", "ingestion_time"],
             limit=10000,
-            selected_fields=("log_stream_name", "ingestion_time"),
         )
-        col_stream = result.column("log_stream_name").to_pylist()
-        col_ingestion = result.column("ingestion_time").to_pylist()
-
         streams = {}
-        for i, stream_name in enumerate(col_stream):
-            if stream_name and stream_name not in streams:
-                ts = col_ingestion[i]
-                streams[stream_name] = {
-                    "logStreamName": stream_name,
+        for ls, ts in zip(
+            result.column("log_stream_name").to_pylist(),
+            result.column("ingestion_time").to_pylist(),
+        ):
+            if ls and ls not in streams:
+                streams[ls] = {
+                    "logStreamName": ls,
                     "creationTime": int(ts.timestamp() * 1000) if ts else 0,
-                    "arn": f"arn:aws:logs:us-east-1:123456789012:log-stream:{log_group_name}/{stream_name}",
+                    "arn": f"arn:aws:logs:us-east-1:123456789012:log-stream:{log_group_name}/{ls}",
                     "storedBytes": 0,
                 }
 
@@ -321,69 +401,52 @@ class QueryMixin:
         table_name: Optional[str] = None,
         labels_filter: Optional[Dict[str, str]] = None,
     ):
-        # Build typed Expression objects — pushed down into Parquet row-group statistics
-        # for true predicate push-down, unlike string-based filters.
-        filter_expression = AlwaysTrue()
-
-        if log_group_name:
-            filter_expression = And(filter_expression, EqualTo("log_group_name", log_group_name))
-        if log_stream_name:
-            filter_expression = And(filter_expression, EqualTo("log_stream_name", log_stream_name))
-        if start_time:
-            # PyIceberg 0.7 requires TimestampLiteral (microseconds since epoch)
-            filter_expression = And(filter_expression, GreaterThanOrEqual("timestamp", TimestampLiteral(int(start_time) * 1000)))
-        if end_time:
-            filter_expression = And(filter_expression, LessThanOrEqual("timestamp", TimestampLiteral(int(end_time) * 1000)))
-        if labels_filter:
-            for k, v in labels_filter.items():
-                label_mapping = {"service_name": "service"}
-                mapped_key = label_mapping.get(k, k)
-                filter_expression = And(filter_expression, EqualTo(f"label_{mapped_key}", v))
-
-        result = self.query(filter_expression=filter_expression, limit=limit, table_name=table_name)
-
-        ts_col = result.column("timestamp").to_pylist()
-        msg_col = result.column("message").to_pylist()
-        ingest_col = result.column("ingestion_time").to_pylist()
-        try:
-            lg_col = result.column("log_group_name").to_pylist()
-        except Exception:
-            lg_col = [None] * result.num_rows
-        try:
-            ls_col = result.column("log_stream_name").to_pylist()
-        except Exception:
-            ls_col = [None] * result.num_rows
-
-        label_columns = self._get_label_columns()
-        label_data = {}
-        for label_col in label_columns:
-            try:
-                label_data[label_col] = result.column(f"label_{label_col}").to_pylist()
-            except Exception:
-                label_data[label_col] = [None] * result.num_rows
-
         import calendar
 
+        result = self.query(
+            log_group_name=log_group_name,
+            log_stream_name=log_stream_name,
+            start_time_ms=start_time,
+            end_time_ms=end_time,
+            limit=limit,
+            table_name=table_name,
+            labels_filter=labels_filter,
+        )
+
         def _naive_utc_to_ms(dt) -> int:
-            """Convert a tz-naive datetime stored as UTC to epoch milliseconds."""
             if dt is None:
                 return 0
             return calendar.timegm(dt.timetuple()) * 1000 + dt.microsecond // 1000
 
+        label_columns = self._get_label_columns()
+        label_data = {}
+        for col in label_columns:
+            try:
+                label_data[col] = result.column(f"label_{col}").to_pylist()
+            except Exception:
+                label_data[col] = [None] * result.num_rows
+
         events = []
+        ts_col = result.column("timestamp").to_pylist() if result.num_rows else []
+        msg_col = result.column("message").to_pylist() if result.num_rows else []
+        ingest_col = result.column("ingestion_time").to_pylist() if result.num_rows else []
+        lg_col = result.column("log_group_name").to_pylist() if result.num_rows else []
+        ls_col = result.column("log_stream_name").to_pylist() if result.num_rows else []
+
         for i in range(result.num_rows):
-            ts = ts_col[i]
-            ts_ms = _naive_utc_to_ms(ts)
             event = {
-                "timestamp": ts_ms,
+                "timestamp": _naive_utc_to_ms(ts_col[i]),
                 "message": msg_col[i] or "",
                 "ingestionTime": _naive_utc_to_ms(ingest_col[i]),
                 "logGroupName": lg_col[i] or "",
                 "logStreamName": ls_col[i] or "",
             }
-            for label_col, values in label_data.items():
-                event[f"label_{label_col}"] = values[i] or ""
+            for col, values in label_data.items():
+                event[f"label_{col}"] = values[i] or ""
             events.append(event)
 
         events.sort(key=lambda x: x["timestamp"])
         return events[:limit] if limit else events
+
+
+

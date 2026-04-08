@@ -140,29 +140,6 @@ def _execute_query(execution: QueryExecution):
 
     if warehouse:
         try:
-            # Build typed Expression objects for predicate push-down into Parquet row groups
-            if _PYICEBERG_EXPR_AVAILABLE:
-                filter_expression = EqualTo("log_group_name", execution.log_group_name)
-                if execution.start_time:
-                    ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
-                    filter_expression = And(filter_expression, GreaterThanOrEqual("timestamp", ts_start))
-                if execution.end_time:
-                    ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
-                    filter_expression = And(filter_expression, LessThanOrEqual("timestamp", ts_end))
-                filter_expr = None
-            else:
-                filter_expression = None
-                where_parts = [f"log_group_name == '{execution.log_group_name}'"]
-                if execution.start_time:
-                    ts_start = datetime.fromtimestamp(execution.start_time, tz=timezone.utc).replace(tzinfo=None)
-                    where_parts.append(f"timestamp >= '{ts_start.isoformat()}'")
-                if execution.end_time:
-                    ts_end = datetime.fromtimestamp(execution.end_time, tz=timezone.utc).replace(tzinfo=None)
-                    where_parts.append(f"timestamp <= '{ts_end.isoformat()}'")
-                filter_expr = " AND ".join(where_parts)
-
-            print(f"[Query] filter_expression={filter_expression is not None} filter_expr={filter_expr}")
-
             limit = (
                 execution.parsed_query.get("limit") or 1000
                 if execution.parsed_query
@@ -179,8 +156,9 @@ def _execute_query(execution: QueryExecution):
             )
             fetch_limit = limit * 3 if cwl_filters else limit
             result = warehouse.query(
-                filter_expr=filter_expr,
-                filter_expression=filter_expression,
+                log_group_name=execution.log_group_name,
+                start_time_ms=execution.start_time,
+                end_time_ms=execution.end_time,
                 limit=fetch_limit,
             )
 
