@@ -752,6 +752,12 @@ def _handle_metric_query(warehouse, query: str, start_ms: int, end_ms: int,
         arrow_tbl = pa.table({"timestamp": pa.array([], type=pa.timestamp("us")),
                                "message": pa.array([], type=pa.utf8())})
 
+    # Guard: _scan_delta_duckdb may return pa.table({}) (no schema) on S3 errors.
+    # Ensure the table always has at least a timestamp column before proceeding.
+    if "timestamp" not in arrow_tbl.schema.names:
+        arrow_tbl = pa.table({"timestamp": pa.array([], type=pa.timestamp("us")),
+                               "message": pa.array([], type=pa.utf8())})
+
     total_lines = arrow_tbl.num_rows
 
     # ---- Vectorised bucketing with PyArrow ----

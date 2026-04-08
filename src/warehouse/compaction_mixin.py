@@ -63,6 +63,15 @@ class CompactionMixin:
                     )
                     logger.info(f"[Compaction] '{target}': vacuumed {files_removed} old file(s)")
 
+                # Create a checkpoint after every compaction so DuckDB readers
+                # only need to read the latest checkpoint + new commits instead
+                # of replaying the full transaction log from the beginning.
+                try:
+                    dt.create_checkpoint()
+                    logger.info(f"[Compaction] '{target}': checkpoint created at v{dt.version()}")
+                except Exception as ckpt_err:
+                    logger.warning(f"[Compaction] '{target}': checkpoint failed (non-fatal): {ckpt_err}")
+
                 return {
                     "status": "success",
                     "wal_flushed": wal_flushed,

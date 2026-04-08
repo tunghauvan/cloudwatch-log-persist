@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -34,6 +35,12 @@ class QueryMixin:
 
         conn = duckdb.connect()
 
+        # Limit threads per connection — 8 gunicorn threads × N DuckDB threads
+        # = too many OS threads competing. 2 threads each is a better tradeoff.
+        conn.execute("SET threads = 2;")
+        memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT", "512MB")
+        conn.execute(f"SET memory_limit = '{memory_limit}';")
+
         # Install extensions (idempotent — fast if already cached locally)
         for ext in ("httpfs", "delta"):
             try:
@@ -44,14 +51,23 @@ class QueryMixin:
         s3_cfg = self.config.get("s3", {})
         use_ec2_role = s3_cfg.get("use_ec2_role", False)
         region = s3_cfg.get("region", "us-east-1")
+        endpoint = (s3_cfg.get("endpoint") or "").strip()
 
-        if not use_ec2_role:
+        # Always create a Secret so delta-kernel-rs picks up the correct region.
+        # For EC2 IAM role, omit KEY_ID/SECRET — delta-kernel-rs will use the
+        # instance profile automatically when no explicit credentials are present.
+        if use_ec2_role:
+            # CREDENTIAL_CHAIN tells delta-kernel-rs to use the AWS credential chain:
+            # EC2 instance profile, ECS task role, kube2iam, IRSA, env vars, etc.
+            secret_sql = f"""
+                CREATE OR REPLACE SECRET _s3_secret (
+                    TYPE S3,
+                    PROVIDER 'CREDENTIAL_CHAIN',
+                    REGION '{region}'
+                );""" 
+        else:
             access_key = s3_cfg.get("access_key", "admin")
             secret_key = s3_cfg.get("secret_key", "admin123")
-            endpoint = s3_cfg.get("endpoint", "").strip()
-
-            # Use DuckDB Secret API — the delta extension (delta-kernel-rs) reads
-            # credentials from Secrets, not from the legacy SET s3_* variables.
             secret_sql = f"""
                 CREATE OR REPLACE SECRET _s3_secret (
                     TYPE S3,
@@ -65,7 +81,7 @@ class QueryMixin:
                 secret_sql += ",\n                    URL_STYLE 'path'"
                 secret_sql += ",\n                    USE_SSL false"
             secret_sql += "\n                );"
-            conn.execute(secret_sql)
+        conn.execute(secret_sql)
 
         _duckdb_local.conn = conn
         return conn
@@ -123,12 +139,26 @@ class QueryMixin:
         if end_dt:
             conditions.append("timestamp <= ?")
             params.append(end_dt)
-        # NOTE: We intentionally do NOT add WHERE filters on the partition columns
-        # `date` and `hour`. DuckDB 1.5.x delta extension has a bug where filtering
-        # on partition-derived columns causes incorrect over-pruning (e.g. adding
-        # `WHERE date = '2026-04-08'` silently drops non-current-hour partitions).
-        # The `timestamp` column filter above is sufficient for correctness; DuckDB
-        # will apply it as a post-scan row filter on all relevant parquet files.
+        # Partition pruning via RANGE predicates on date/hour.
+        # DuckDB bug: EQUALITY on partition columns (date = 'x' or date >= 'x' AND date <= 'x'
+        # with the same value) silently drops all rows. Only add date filter when the range
+        # spans more than one day so the predicate is a true open range.
+        if start_dt and end_dt:
+            start_date = start_dt.strftime("%Y-%m-%d")
+            end_date = end_dt.strftime("%Y-%m-%d")
+            if start_date != end_date:
+                conditions.append("date >= ?")
+                params.append(start_date)
+                conditions.append("date <= ?")
+                params.append(end_date)
+        elif start_dt:
+            start_date = start_dt.strftime("%Y-%m-%d")
+            conditions.append("date >= ?")
+            params.append(start_date)
+        elif end_dt:
+            end_date = end_dt.strftime("%Y-%m-%d")
+            conditions.append("date <= ?")
+            params.append(end_date)
 
         if labels_filter:
             label_mapping = {"service_name": "service"}
@@ -149,23 +179,29 @@ class QueryMixin:
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
+        # No ORDER BY in DuckDB — sorting all rows before LIMIT is expensive when
+        # scanning many files. We sort the final result in Python after merging with WAL.
+        # NOTE: delta_scan() does NOT support parameterized path (delta_scan(?)) —
+        # passing the path as a bind parameter causes it to silently return 0 rows.
+        # The path must be inlined as a literal. Conditions still use ? bind params.
+        safe_uri = delta_uri.replace("'", "''")
         sql = f"""
             SELECT {col_select}
-            FROM delta_scan(?)
+            FROM delta_scan('{safe_uri}')
             {where}
-            ORDER BY timestamp ASC
             LIMIT {int(limit)}
         """
 
-        try:
-            conn = self._get_duckdb_conn()
-            result = conn.execute(sql, [delta_uri] + params).fetch_arrow_table()
-            # Strip partition helper columns unless explicitly requested
+        def _execute(conn):
+            r = conn.execute(sql, params).to_arrow_table()
             drop_cols = {"date", "hour"} - (set(columns) if columns else set())
-            keep = [c for c in result.schema.names if c not in drop_cols]
-            if keep and len(keep) < result.num_columns:
-                result = result.select(keep)
-            return result
+            keep = [c for c in r.schema.names if c not in drop_cols]
+            if keep and len(keep) < r.num_columns:
+                r = r.select(keep)
+            return r
+
+        try:
+            return _execute(self._get_duckdb_conn())
         except Exception as e:
             msg = str(e)
             # Table not yet initialised — silently return empty
@@ -174,7 +210,22 @@ class QueryMixin:
                 "Invariant violation", "TableNotFound",
             )):
                 return pa.table({})
-            # For other errors (stale file refs, S3 issues) log a warning and return empty
+            # 404 = vacuum ran between snapshot read and file fetch (stale snapshot race).
+            # Reset connection for a fresh delta log read and retry once.
+            if "404" in msg or "Not Found" in msg:
+                logger.debug(
+                    f"[DuckDB] stale snapshot for '{table_name}', retrying with fresh conn"
+                )
+                self._reset_duckdb_conn()
+                try:
+                    return _execute(self._get_duckdb_conn())
+                except Exception as retry_e:
+                    logger.warning(
+                        f"[DuckDB] delta_scan retry failed for '{table_name}': {type(retry_e).__name__}: {retry_e}"
+                    )
+                    self._reset_duckdb_conn()
+                    return pa.table({})
+            # For other errors (auth, network) log a warning and return empty
             # so individual query failures don't bring down the service.
             logger.warning(
                 f"[DuckDB] delta_scan failed for '{table_name}': {type(e).__name__}: {e}"
@@ -303,20 +354,23 @@ class QueryMixin:
 
             if len(parts) == 0:
                 result = pa.table({})
-            elif len(parts) == 1:
-                result = parts[0]
             else:
+                # Always sort in Python — DuckDB no longer emits ORDER BY (perf).
                 try:
-                    combined = pa.concat_tables(parts, promote_options="default")
+                    combined = pa.concat_tables(parts, promote_options="default") if len(parts) > 1 else parts[0]
                 except Exception:
-                    combined = s3_result
-                sort_idx = pc.sort_indices(combined, sort_keys=[("timestamp", "ascending")])
-                result = combined.take(sort_idx)
+                    combined = s3_result if s3_result is not None and s3_result.num_rows > 0 else pa.table({})
+                if combined.num_rows > 0 and "timestamp" in combined.schema.names:
+                    sort_idx = pc.sort_indices(combined, sort_keys=[("timestamp", "ascending")])
+                    result = combined.take(sort_idx)
+                else:
+                    result = combined
                 if limit and limit > 0 and result.num_rows > limit:
                     result = result.slice(0, limit)
 
-            logger.debug(
-                f"[DuckDB] Query '{target}': {result.num_rows} rows "
+            elapsed = time.time() - start
+            logger.info(
+                f"[DuckDB] Query '{target}': {result.num_rows} rows in {elapsed:.2f}s "
                 f"(delta={s3_result.num_rows if s3_result is not None else 0}, "
                 f"wal={wal_result.num_rows if wal_result is not None else 0})"
             )
